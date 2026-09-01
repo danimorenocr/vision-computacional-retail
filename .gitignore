@@ -1,0 +1,45 @@
+# Python / Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.cache/
+
+# Entornos Virtuales
+venv/
+.venv/
+env/
+ENV/
+
+# Archivos de configuración de IDE y S.O.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archivos de Video (grabaciones de origen y prueba)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Pesos de Modelos (YOLO / PyTorch / ONNX)
+*.pt
+*.onnx
+*.engine
+*.tflite
+
+# Archivos de datos generados y exportaciones
+*_tracking.csv
+*_resumen.csv
+*_movimientos.csv
+*_zonas.csv
+*_tracking.json
+*_annotated.mp4
+*_calor.mp4
+salida_clip_test_largo/
+salida_grabacion2/
+output/
+logs/
+*.log

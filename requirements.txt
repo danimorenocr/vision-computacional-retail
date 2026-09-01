@@ -1,0 +1,19 @@
+# Índice extra para instalar PyTorch con soporte para GPU (CUDA 12.1)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Visión por Computador y Tracking
+ultralytics
+opencv-python
+
+# Deep Learning (PyTorch con GPU)
+torch
+torchvision
+
+# Procesamiento, Análisis de Datos y Soporte Parquet
+numpy
+pandas
+pyarrow
+
+# Interfaz Gráfica y Manejo de Imágenes
+Pillow
+
