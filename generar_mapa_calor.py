@@ -24,6 +24,8 @@ import pandas as pd
 
 
 def punto_en_poligono(x, y, poligono):
+    if poligono is None or len(poligono) < 3:
+        return False
     if np.isnan(x) or np.isnan(y):
         return False
     return cv2.pointPolygonTest(np.array(poligono, dtype=np.float32), (float(x), float(y)), False) >= 0
@@ -34,6 +36,8 @@ def es_alcance_real_a_gondola(row, pts_poligono, max_dist_pies_px=220.0):
     Filtro Biomecánico Anti-Ruido 2D:
     Valida proximidad de pies, extensión del brazo y orientación del torso/mirada.
     """
+    if pts_poligono is None or len(pts_poligono) < 3:
+        return False
     lw_x, lw_y = row.get("left_wrist_x", np.nan), row.get("left_wrist_y", np.nan)
     rw_x, rw_y = row.get("right_wrist_x", np.nan), row.get("right_wrist_y", np.nan)
 

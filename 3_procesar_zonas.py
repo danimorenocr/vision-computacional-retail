@@ -20,9 +20,13 @@ import json
 import argparse
 import numpy as np
 import pandas as pd
+import requests
+from datetime import datetime, timezone
 
 
 def punto_en_zona(x, y, poligono):
+    if poligono is None or len(poligono) < 3:
+        return False
     if np.isnan(x) or np.isnan(y):
         return False
     return cv2.pointPolygonTest(np.array(poligono, dtype=np.float32), (float(x), float(y)), False) >= 0
@@ -114,6 +118,9 @@ def es_alcance_real_a_gondola(row, pts_poligono, max_dist_pies_px=220.0):
     2. Extensión del Brazo: La muñeca debe estar extendida fuera de reposo vertical de marcha.
     3. Orientación del Pecho / Mirada: El torso y rostro deben estar orientados hacia la góndola.
     """
+    if pts_poligono is None or len(pts_poligono) < 3:
+        return False
+
     lw_x, lw_y = row.get("left_wrist_x", np.nan), row.get("left_wrist_y", np.nan)
     rw_x, rw_y = row.get("right_wrist_x", np.nan), row.get("right_wrist_y", np.nan)
 
@@ -321,14 +328,14 @@ def clasificar_pickup_putback(df, zonas_interaccion, video_path=None, min_votaci
         score_sin_oclusion = evaluar_cambio_repisa_sin_oclusion(cap, np.array(pts_zona), frame_pre_limpio, frame_post_limpio)
 
         # Regla de Confirmación:
-        # Si volvió a tocar la repisa -> PUT-BACK
-        # Si se alejó caminando O el estante sin oclusión cambió permanentemente (score >= 0.030) -> PICK-UP
+        # Si volvió a tocar la repisa -> PUT
+        # Si se alejó caminando O el estante sin oclusión cambió permanentemente (score >= 0.030) -> TAKE
         if len(re_alcance) > 0:
-            tipo_evento = "PUT-BACK"
+            tipo_evento = "PUT"
         elif se_alejo or score_sin_oclusion >= 0.030:
-            tipo_evento = "PICK-UP"
+            tipo_evento = "TAKE"
         else:
-            tipo_evento = "PUT-BACK"
+            tipo_evento = "PUT"
 
         clasificaciones.append(tipo_evento)
 
@@ -340,8 +347,8 @@ def clasificar_pickup_putback(df, zonas_interaccion, video_path=None, min_votaci
     resumen_gondolas = []
     for zona_id, grp in df_eventos.groupby("zona"):
         alcances = len(grp)
-        pickups = sum(grp["tipo_accion"] == "PICK-UP")
-        putbacks = sum(grp["tipo_accion"] == "PUT-BACK")
+        pickups = sum(grp["tipo_accion"] == "TAKE")
+        putbacks = sum(grp["tipo_accion"] == "PUT")
 
         tasa_conversion = (pickups / alcances) * 100.0 if alcances > 0 else 0.0
         tasa_rechazo = (putbacks / alcances) * 100.0 if alcances > 0 else 0.0
@@ -360,7 +367,72 @@ def clasificar_pickup_putback(df, zonas_interaccion, video_path=None, min_votaci
     return df_eventos, df_resumen
 
 
-def main(parquet_path, zonas_json_path, video_path=None, min_votacion=6, carpeta_salida=None):
+def enviar_eventos_backend(df_eventos, dwell_df, tenant_id, store_id, api_url):
+    eventos_json = []
+    
+    def safe_float(v):
+        try:
+            val = float(v)
+            return val if not np.isnan(val) else 0.0
+        except:
+            return 0.0
+
+    def safe_int(v):
+        try:
+            val = float(v)
+            return int(val) if not np.isnan(val) else 0
+        except:
+            return 0
+
+    # 1. Eventos de Interacción (TAKE, PUT)
+    if df_eventos is not None and not df_eventos.empty:
+        for _, ev in df_eventos.iterrows():
+            timestamp = datetime.now(timezone.utc).isoformat()
+            eventos_json.append({
+                "tenant_id": tenant_id,
+                "store_id": store_id,
+                "camera_id": "cam_01",
+                "track_id": safe_int(ev.get("track_id", 0)),
+                "zone_id": str(ev.get("zona", "unknown")),
+                "shelf_id": str(ev.get("zona", "unknown")),
+                "action": str(ev.get("tipo_accion", "UNKNOWN")),
+                "timestamp": timestamp,
+                "confidence": 0.90,
+                "duration_s": safe_float(ev.get("duracion_s", 0.0))
+            })
+            
+    # 2. Eventos de Flujo (OBSERVE) desde Dwell Time
+    if dwell_df is not None and not dwell_df.empty:
+        for _, dw in dwell_df.iterrows():
+            timestamp = datetime.now(timezone.utc).isoformat()
+            eventos_json.append({
+                "tenant_id": tenant_id,
+                "store_id": store_id,
+                "camera_id": "cam_01",
+                "track_id": safe_int(dw.get("track_id", 0)),
+                "zone_id": str(dw.get("zona", "unknown")),
+                "shelf_id": str(dw.get("zona", "unknown")),
+                "action": "OBSERVE",
+                "timestamp": timestamp,
+                "confidence": 0.95,
+                "duration_s": safe_float(dw.get("duracion_s", 0.0))
+            })
+
+    if not eventos_json:
+        print("No hay eventos para enviar al backend.")
+        return
+
+    print(f"\n🚀 Enviando {len(eventos_json)} eventos a {api_url}...")
+    try:
+        response = requests.post(api_url, json=eventos_json, timeout=10)
+        if response.status_code in [200, 201]:
+            print(f"✅ Eventos enviados correctamente. Status: {response.status_code}")
+        else:
+            print(f"⚠️ Error al enviar eventos. Status: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"❌ Excepción al conectar con el backend: {e}")
+
+def main(parquet_path, zonas_json_path, video_path=None, min_votacion=6, carpeta_salida=None, tenant_id="tenant_01", store_id="store_01", api_url="http://localhost:3000/api/v1/events/batch"):
     if not os.path.exists(parquet_path):
         raise FileNotFoundError(f"No se encontró el archivo Parquet: {parquet_path}")
     if not os.path.exists(zonas_json_path):
@@ -374,8 +446,8 @@ def main(parquet_path, zonas_json_path, video_path=None, min_votacion=6, carpeta
         zonas_config = json.load(f)
 
     zonas = zonas_config.get("zones", zonas_config.get("zonas", []))
-    zonas_flujo = [z for z in zonas if z.get("type", "").lower() == "flujo"]
-    zonas_interaccion = [z for z in zonas if z.get("type", "").lower() == "interaccion"]
+    zonas_flujo = [z for z in zonas if z.get("type", "").lower() == "flujo" and len(z.get("polygon", z.get("poligono", []))) >= 3]
+    zonas_interaccion = [z for z in zonas if z.get("type", "").lower() == "interaccion" and len(z.get("polygon", z.get("poligono", []))) >= 3]
 
     print("\n" + "=" * 60)
     print("📊 CLASIFICACIÓN CON VOTACIÓN TEMPORAL Y COMPARACIÓN SIN OCLUSIÓN")
@@ -423,6 +495,10 @@ def main(parquet_path, zonas_json_path, video_path=None, min_votacion=6, carpeta
         print("No hay zonas de góndola definidas.")
 
     print("=" * 60 + "\n")
+    
+    df_eventos_enviar = df_eventos if 'df_eventos' in locals() else None
+    dwell_df_enviar = dwell_df if 'dwell_df' in locals() else None
+    enviar_eventos_backend(df_eventos_enviar, dwell_df_enviar, tenant_id, store_id, api_url)
 
 
 if __name__ == "__main__":
@@ -432,6 +508,9 @@ if __name__ == "__main__":
     parser.add_argument("--video", default=None, help="Ruta del video opcional")
     parser.add_argument("--min_votacion", type=int, default=6, help="Fotogramas seguidos mínimos para confirmar alcance (default 6)")
     parser.add_argument("--carpeta", default=None, help="Carpeta de salida unificada (opcional)")
+    parser.add_argument("--tenant_id", default="tenant_01", help="ID del Tenant B2B")
+    parser.add_argument("--store_id", default="store_01", help="ID de la Tienda")
+    parser.add_argument("--api_url", default="http://localhost:3000/api/v1/events/batch", help="URL del Backend para enviar eventos")
     args = parser.parse_args()
 
-    main(args.parquet, args.zonas, video_path=args.video, min_votacion=args.min_votacion, carpeta_salida=args.carpeta)
+    main(args.parquet, args.zonas, video_path=args.video, min_votacion=args.min_votacion, carpeta_salida=args.carpeta, tenant_id=args.tenant_id, store_id=args.store_id, api_url=args.api_url)
