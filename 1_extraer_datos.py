@@ -654,6 +654,9 @@ def modo_guardar(video_path, camera_id, modelo_path="yolo26n-pose.pt",
                     frame, frame_idx = item
 
                     frames_procesados += 1
+                    t_frame_start = time.time()
+                    ids = []
+                    r = None
 
                     try:
                         resultados = model.track(
@@ -666,9 +669,8 @@ def modo_guardar(video_path, camera_id, modelo_path="yolo26n-pose.pt",
                             verbose=False,
                             device=dispositivo_real
                         )
-                        if not resultados or len(resultados) == 0:
-                            continue
-                        r = resultados[0]
+                        if resultados and len(resultados) > 0:
+                            r = resultados[0]
 
                         if r.boxes.id is not None and r.keypoints is not None:
                             boxes = r.boxes.xyxy.cpu().numpy()
@@ -711,14 +713,17 @@ def modo_guardar(video_path, camera_id, modelo_path="yolo26n-pose.pt",
                         print(f"\n⚠️ Error procesando frame {frame_idx}: {e}. Continuando...", flush=True)
                         continue
 
-                    if frames_procesados % 30 == 0:
-                        elapsed = time.time() - t_inicio
-                        fps_proc = frames_procesados / elapsed
-                        pct = (frame_idx / max(total_frames, 1)) * 100
-                        t_act_s = frame_idx / fps
-                        restante_s = (total_frames - frame_idx) / (fps_proc * max(frame_skip, 1)) if fps_proc > 0 else 0
-                        print(f"Frame {frame_idx}/{total_frames} ({pct:.1f}%) | Tiempo video: {format_mmss(t_act_s)}/{format_mmss(duracion_total_s)} | "
-                              f"{fps_proc:.1f} fps proc | Transcurrido: {elapsed:.1f}s | ETA: {restante_s:.1f}s", end="\r", flush=True)
+                    t_frame_ms = (time.time() - t_frame_start) * 1000.0
+                    elapsed = time.time() - t_inicio
+                    fps_proc = frames_procesados / max(elapsed, 0.001)
+                    pct = (frame_idx / max(total_frames, 1)) * 100
+                    t_act_s = frame_idx / fps
+                    restante_s = (total_frames - frame_idx) / (fps_proc * max(frame_skip, 1)) if fps_proc > 0 else 0
+                    
+                    num_personas = len(ids) if ('r' in locals() and r is not None and r.boxes.id is not None and len(r.boxes.id) > 0) else 0
+                    lista_ids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+                    str_ids = f" (IDs: {lista_ids})" if lista_ids else ""
+                    print(f"[Frame {frame_idx}/{total_frames} ({pct:5.1f}%)] ⏱️ {t_frame_ms:4.0f}ms | {fps_proc:4.1f} fps proc | Video: {format_mmss(t_act_s)}/{format_mmss(duracion_total_s)} | Personas: {num_personas}{str_ids} | ETA: {format_mmss(restante_s)}", flush=True)
         finally:
             reader.stop()
 
