@@ -39,8 +39,10 @@ desktop.ini
 *_tracking.json
 *_annotated.mp4
 *_calor.mp4
+salida_clip_test/
 salida_clip_test_largo/
 salida_grabacion2/
 output/
 logs/
 *.log
+*.parquet
