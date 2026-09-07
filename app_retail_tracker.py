@@ -22,6 +22,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import numpy as np
 import pandas as pd
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 from PIL import Image, ImageTk
 
 # Importar funciones de la pipeline local
@@ -70,8 +75,11 @@ class RetailTrackerApp:
         self.video_path = tk.StringVar()
         self.camera_id = tk.StringVar(value="cam_04")
         self.carpeta_salida = tk.StringVar()
-        self.frame_skip = tk.IntVar(value=2)
+        self.modelo_path = tk.StringVar(value="yolo26n-pose_640_openvino_model")
+        self.imgsz = tk.IntVar(value=640)
+        self.frame_skip = tk.IntVar(value=1)
         self.conf_thresh = tk.DoubleVar(value=0.25)
+        self.dispositivo_opt = tk.StringVar(value="⚡ GPU (CUDA)" if torch.cuda.is_available() else "💻 Solo CPU")
         self.generar_video_anotado = tk.BooleanVar(value=False)
 
         self.frame_original = None
@@ -193,6 +201,24 @@ class RetailTrackerApp:
         ent_cam.pack(fill=tk.X, pady=(2, 6))
         self.camera_id.trace_add("write", lambda *args: self.actualizar_carpeta_salida())
 
+        ttk.Label(sec1, text="Modelo Pose (PyTorch / OpenVINO):", background=self.colors["card"]).pack(anchor="w")
+        frame_modelo = ttk.Frame(sec1, style="Card.TFrame")
+        frame_modelo.pack(fill=tk.X, pady=(2, 6))
+
+        self.modelos_disponibles = [
+            "yolo26n-pose_640_openvino_model",
+            "yolo26n-pose_480_openvino_model",
+            "yolo26n-pose.pt",
+            "yolo26s-pose.pt"
+        ]
+
+        self.cb_modelo = ttk.Combobox(frame_modelo, textvariable=self.modelo_path, values=self.modelos_disponibles, font=("Segoe UI", 9))
+        self.cb_modelo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.cb_modelo.bind("<<ComboboxSelected>>", self.on_modelo_selected)
+
+        btn_browse_mod = ttk.Button(frame_modelo, text="📁 Buscar", width=8, command=self.buscar_modelo)
+        btn_browse_mod.pack(side=tk.RIGHT)
+
         ttk.Label(sec1, text="Carpeta de Salida Unificada:", background=self.colors["card"]).pack(anchor="w")
         ent_out = ttk.Entry(sec1, textvariable=self.carpeta_salida, font=("Segoe UI", 9))
         ent_out.pack(fill=tk.X, pady=(2, 6))
@@ -201,14 +227,24 @@ class RetailTrackerApp:
         frame_params.pack(fill=tk.X, pady=(4, 0))
 
         lbl_fskip = ttk.Label(frame_params, text="Frame Skip:", background=self.colors["card"])
-        lbl_fskip.grid(row=0, column=0, sticky="w", padx=(0, 5))
-        spn_fskip = ttk.Spinbox(frame_params, from_=1, to=10, textvariable=self.frame_skip, width=5)
-        spn_fskip.grid(row=0, column=1, padx=(0, 15))
+        lbl_fskip.grid(row=0, column=0, sticky="w", padx=(0, 3))
+        spn_fskip = ttk.Spinbox(frame_params, from_=1, to=10, textvariable=self.frame_skip, width=4)
+        spn_fskip.grid(row=0, column=1, padx=(0, 8))
 
         lbl_conf = ttk.Label(frame_params, text="Confianza:", background=self.colors["card"])
-        lbl_conf.grid(row=0, column=2, sticky="w", padx=(0, 5))
-        spn_conf = ttk.Spinbox(frame_params, from_=0.1, to=0.9, increment=0.05, textvariable=self.conf_thresh, width=5)
-        spn_conf.grid(row=0, column=3)
+        lbl_conf.grid(row=0, column=2, sticky="w", padx=(0, 3))
+        spn_conf = ttk.Spinbox(frame_params, from_=0.1, to=0.9, increment=0.05, textvariable=self.conf_thresh, width=4)
+        spn_conf.grid(row=0, column=3, padx=(0, 8))
+
+        lbl_imgsz = ttk.Label(frame_params, text="ImgSize:", background=self.colors["card"])
+        lbl_imgsz.grid(row=0, column=4, sticky="w", padx=(0, 3))
+        spn_imgsz = ttk.Spinbox(frame_params, values=(480, 640, 320, 1280), textvariable=self.imgsz, width=5)
+        spn_imgsz.grid(row=0, column=5)
+
+        lbl_disp = ttk.Label(frame_params, text="⚡ Motor:", background=self.colors["card"])
+        lbl_disp.grid(row=1, column=0, columnspan=2, sticky="w", padx=(0, 3), pady=(5, 0))
+        cb_disp = ttk.Combobox(frame_params, textvariable=self.dispositivo_opt, values=["⚡ GPU (CUDA)", "💻 Solo CPU"], state="readonly", width=14, font=("Segoe UI", 9))
+        cb_disp.grid(row=1, column=2, columnspan=4, sticky="w", pady=(5, 0))
 
         sec2 = ttk.Frame(left_panel, style="Card.TFrame", padding=10)
         sec2.pack(fill=tk.X, pady=(0, 8))
@@ -242,13 +278,6 @@ class RetailTrackerApp:
         self.btn_generar_mapas = ttk.Button(sec3, text="📊 GENERAR MAPAS Y MÉTRICAS", command=self.generar_mapas_y_metricas)
         self.btn_generar_mapas.pack(fill=tk.X, ipady=4)
 
-        sec4 = ttk.Frame(left_panel, style="Card.TFrame", padding=8)
-        sec4.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(sec4, text="Registro de Ejecución (Logs):", background=self.colors["card"], font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 4))
-        self.txt_log = scrolledtext.ScrolledText(sec4, bg="#11111b", fg="#a6adc8", font=("Consolas", 8), relief="flat", height=8)
-        self.txt_log.pack(fill=tk.BOTH, expand=True)
-
         right_panel = ttk.Frame(main_container)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
@@ -269,6 +298,9 @@ class RetailTrackerApp:
         btn_cancel = ttk.Button(canvas_bar, text="❌ Cancelar ('n')", command=self.cancelar_poligono)
         btn_cancel.pack(side=tk.LEFT, padx=8)
 
+        btn_load_json = ttk.Button(canvas_bar, text="📂 Cargar JSON Zonas", command=self.buscar_y_cargar_json_zonas)
+        btn_load_json.pack(side=tk.RIGHT, padx=(0, 5))
+
         btn_save_json = ttk.Button(canvas_bar, text="💾 Guardar JSON Zonas", style="Accent.TButton", command=self.guardar_json_zonas)
         btn_save_json.pack(side=tk.RIGHT)
 
@@ -284,19 +316,26 @@ class RetailTrackerApp:
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
         self.root.bind("<Key>", self.on_key_press)
 
-        zone_list_frame = ttk.Frame(work_area, width=210, style="Card.TFrame", padding=10)
-        zone_list_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        zone_list_frame = ttk.Frame(work_area, width=320, style="Card.TFrame", padding=10)
+        zone_list_frame.pack(side=tk.RIGHT, fill=tk.BOTH)
         zone_list_frame.pack_propagate(False)
 
-        ttk.Label(zone_list_frame, text="Zonas Creadas:", background=self.colors["card"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
-        self.lst_zonas = tk.Listbox(zone_list_frame, bg="#181825", fg=self.colors["fg"], selectbackground=self.colors["accent"], selectforeground="#11111b", borderwidth=0, font=("Segoe UI", 9))
-        self.lst_zonas.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        ttk.Label(zone_list_frame, text="Zonas Creadas:", background=self.colors["card"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 4))
+        self.lst_zonas = tk.Listbox(zone_list_frame, bg="#181825", fg=self.colors["fg"], selectbackground=self.colors["accent"], selectforeground="#11111b", borderwidth=0, font=("Segoe UI", 9), height=5)
+        self.lst_zonas.pack(fill=tk.X, pady=(0, 6))
 
-        btn_del_zona = ttk.Button(zone_list_frame, text="🗑️ Eliminar Zona", command=self.eliminar_zona_seleccionada)
-        btn_del_zona.pack(fill=tk.X, pady=(0, 4))
+        frame_zone_btns = ttk.Frame(zone_list_frame, style="Card.TFrame")
+        frame_zone_btns.pack(fill=tk.X, pady=(0, 8))
 
-        btn_clear_zonas = ttk.Button(zone_list_frame, text="⚠️ Borrar Todas", command=self.limpiar_todas_las_zonas)
-        btn_clear_zonas.pack(fill=tk.X)
+        btn_del_zona = ttk.Button(frame_zone_btns, text="🗑️ Eliminar Zona", command=self.eliminar_zona_seleccionada)
+        btn_del_zona.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+
+        btn_clear_zonas = ttk.Button(frame_zone_btns, text="⚠️ Borrar Todas", command=self.limpiar_todas_las_zonas)
+        btn_clear_zonas.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
+
+        ttk.Label(zone_list_frame, text="📋 Registro de Ejecución (Logs):", background=self.colors["card"], font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 4))
+        self.txt_log = scrolledtext.ScrolledText(zone_list_frame, bg="#11111b", fg="#a6adc8", font=("Consolas", 8), relief="flat")
+        self.txt_log.pack(fill=tk.BOTH, expand=True)
 
         # ---------------------------------------------------------------------
         # PESTAÑA 2: CALIBRACIÓN DE HOMOGRAFÍA LADO A LADO POR ZONAS JSON
@@ -310,11 +349,11 @@ class RetailTrackerApp:
         bar_hom = ttk.Frame(hom_container, style="Card.TFrame", padding=10)
         bar_hom.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(bar_hom, text="🌐 Calibración Multicámara con Zonas JSON (Góndolas y Pasillos)", style="Header.TLabel", background=self.colors["card"]).pack(anchor="w", pady=(0, 2))
+        ttk.Label(bar_hom, text="🌐 Calibración Multicámara por Puntos P1..P4 (Lado a Lado)", style="Header.TLabel", background=self.colors["card"]).pack(anchor="w", pady=(0, 2))
 
         self.lbl_instrucciones_hom = ttk.Label(
             bar_hom,
-            text="Carga los videos y JSONs de zonas para ambas cámaras o marca los puntos P1..P4 para calibrar.",
+            text="Marca los puntos correspondientes P1..P4 en ambas cámaras para calibrar.",
             background=self.colors["card"], font=("Segoe UI", 10, "bold"), foreground=self.colors["warning"]
         )
         self.lbl_instrucciones_hom.pack(anchor="w", pady=(0, 6))
@@ -330,35 +369,23 @@ class RetailTrackerApp:
         btn_browse_ref = ttk.Button(frame_cams_select, text="📁 Video Ref", command=self.cargar_video_hom_ref)
         btn_browse_ref.grid(row=0, column=2, padx=(0, 4))
 
-        btn_json_ref = ttk.Button(frame_cams_select, text="🏷️ JSON Zonas Ref", command=self.buscar_json_hom_ref)
-        btn_json_ref.grid(row=0, column=3, padx=(0, 4))
-
         btn_parquet_ref = ttk.Button(frame_cams_select, text="📊 Parquet Ref", command=self.buscar_parquet_ref)
-        btn_parquet_ref.grid(row=0, column=4, padx=(0, 15))
+        btn_parquet_ref.grid(row=0, column=3, padx=(0, 15))
 
         # Fila 1: Entradas para Cámara Secundaria (Derecha)
-        ttk.Label(frame_cams_select, text="Cam Sec:", background=self.colors["card"], font=("Segoe UI", 9, "bold")).grid(row=0, column=5, sticky="w", padx=(0, 2))
+        ttk.Label(frame_cams_select, text="Cam Sec:", background=self.colors["card"], font=("Segoe UI", 9, "bold")).grid(row=0, column=4, sticky="w", padx=(0, 2))
         ent_sec_id = ttk.Entry(frame_cams_select, textvariable=self.cam_sec_id, width=8)
-        ent_sec_id.grid(row=0, column=6, padx=(0, 4))
+        ent_sec_id.grid(row=0, column=5, padx=(0, 4))
 
         btn_browse_sec = ttk.Button(frame_cams_select, text="📁 Video Sec", command=self.cargar_video_hom_sec)
-        btn_browse_sec.grid(row=0, column=7, padx=(0, 4))
-
-        btn_json_sec = ttk.Button(frame_cams_select, text="🏷️ JSON Zonas Sec", command=self.buscar_json_hom_sec)
-        btn_json_sec.grid(row=0, column=8, padx=(0, 4))
+        btn_browse_sec.grid(row=0, column=6, padx=(0, 4))
 
         btn_parquet_sec = ttk.Button(frame_cams_select, text="📊 Parquet Sec", command=self.buscar_parquet_sec)
-        btn_parquet_sec.grid(row=0, column=9, padx=(0, 15))
+        btn_parquet_sec.grid(row=0, column=7, padx=(0, 15))
 
         # Acciones de Homografía
-        btn_emparejar = ttk.Button(frame_cams_select, text="🛒 SELECCIONAR / EMPAREJAR GÓNDOLAS", style="Flujo.TButton", command=self.abrir_modal_emparejamiento_gondolas)
-        btn_emparejar.grid(row=0, column=10, padx=(0, 5))
-
-        btn_auto_zonas = ttk.Button(frame_cams_select, text="🏷️ CALCULAR POR GÓNDOLAS", style="Gondola.TButton", command=self.autocalibrar_homografia_por_zonas)
-        btn_auto_zonas.grid(row=0, column=11, padx=(0, 5))
-
         btn_calc_hom = ttk.Button(frame_cams_select, text="📐 GENERAR MAPAS EN 'homografia/'", style="Accent.TButton", command=self.resolver_homografia_y_guardar_carpeta_homografia)
-        btn_calc_hom.grid(row=0, column=12, padx=(0, 0))
+        btn_calc_hom.grid(row=0, column=8, padx=(0, 0))
 
         # Canvases Lado a Lado
         canvases_hom_frame = ttk.Frame(hom_container)
@@ -404,6 +431,32 @@ class RetailTrackerApp:
     # -------------------------------------------------------------------------
     # FUNCIONES PESTAÑA 1 (INFERENCIA Y ZONAS)
     # -------------------------------------------------------------------------
+    def on_modelo_selected(self, event=None):
+        mod = self.modelo_path.get()
+        if "480" in mod:
+            self.imgsz.set(480)
+        elif "640" in mod:
+            self.imgsz.set(640)
+        self.log(f"🧠 Modelo seleccionado: {mod} | ImgSize: {self.imgsz.get()}")
+
+    def buscar_modelo(self):
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar Modelo (.pt o carpeta OpenVINO)",
+            filetypes=[("Modelos PyTorch", "*.pt"), ("Todos los archivos", "*.*")]
+        )
+        if ruta:
+            self.modelo_path.set(ruta)
+            self.on_modelo_selected()
+
+    def obtener_ruta_modelo_absoluta(self):
+        mod = self.modelo_path.get().strip()
+        if os.path.isabs(mod) and os.path.exists(mod):
+            return mod
+        candidato = os.path.join(dir_actual, mod)
+        if os.path.exists(candidato):
+            return candidato
+        return mod
+
     def escaneo_inicial_videos(self):
         archivos = glob.glob("*.mp4") + glob.glob("*.avi") + glob.glob("*.mkv")
         if archivos:
@@ -426,12 +479,22 @@ class RetailTrackerApp:
         self.cargar_primer_frame_video(vpath)
 
         cam_id = self.camera_id.get().strip() or "cam_04"
-        posible_json = os.path.join(self.carpeta_salida.get(), f"zonas_{cam_id}.json")
-        if not os.path.exists(posible_json):
-            posible_json = f"zonas_{cam_id}.json"
+        
+        # Buscar JSON al mismo nivel del video con su mismo nombre primero
+        video_dir = os.path.dirname(os.path.abspath(vpath))
+        base_name = os.path.splitext(os.path.basename(vpath))[0]
 
-        if os.path.exists(posible_json):
-            self.cargar_json_existente(posible_json)
+        posibles_jsons = [
+            os.path.join(video_dir, f"{base_name}_zonas.json"),
+            os.path.join(video_dir, f"{base_name}.json"),
+            os.path.join(self.carpeta_salida.get(), f"zonas_{cam_id}.json"),
+            f"zonas_{cam_id}.json"
+        ]
+
+        for pjson in posibles_jsons:
+            if os.path.exists(pjson):
+                self.cargar_json_existente(pjson)
+                break
 
     def actualizar_carpeta_salida(self):
         vpath = self.video_path.get()
@@ -442,6 +505,8 @@ class RetailTrackerApp:
 
     def cargar_primer_frame_video(self, vpath):
         cap = cv2.VideoCapture(vpath)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         ret, frame = cap.read()
         cap.release()
 
@@ -449,9 +514,23 @@ class RetailTrackerApp:
             messagebox.showerror("Error de Video", f"No se pudo leer el video: {vpath}")
             return
 
+        nombre_video = os.path.basename(vpath)
+        duracion_s = total_frames / fps if fps > 0 else 0.0
+
+        print("\n" + "=" * 60)
+        print(f"🎬 VIDEO SELECCIONADO: {nombre_video}")
+        print(f"   ► FPS (Cuadros por segundo): {fps:.2f} fps")
+        print(f"   ► Total de frames: {total_frames}")
+        print(f"   ► Resolución: {frame.shape[1]}x{frame.shape[0]} px")
+        if duracion_s > 0:
+            m = int(duracion_s // 60)
+            s = int(duracion_s % 60)
+            print(f"   ► Duración total: {m:02d}:{s:02d} ({duracion_s:.1f}s)")
+        print("=" * 60 + "\n")
+
         self.frame_original = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         self.h_orig, self.w_orig = self.frame_original.shape[:2]
-        self.log(f"Video cargado: {os.path.basename(vpath)} ({self.w_orig}x{self.h_orig} px)")
+        self.log(f"📹 Video cargado: {nombre_video} | {fps:.2f} FPS | {self.w_orig}x{self.h_orig} px ({total_frames} frames)")
         self.redibujar_canvas()
 
     def redibujar_canvas(self):
@@ -574,20 +653,45 @@ class RetailTrackerApp:
 
     def guardar_json_zonas(self):
         if not self.zonas:
+            messagebox.showwarning("Atención", "No hay zonas creadas para guardar.")
             return None
 
+        vpath = self.video_path.get()
         out_dir = self.carpeta_salida.get().strip() or "resultados"
         os.makedirs(out_dir, exist_ok=True)
-
         cam_id = self.camera_id.get().strip() or "cam_01"
-        ruta_json = os.path.join(out_dir, f"zonas_{cam_id}.json")
 
         contenido = {"camera_id": cam_id, "zones": self.zonas}
-        with open(ruta_json, "w", encoding="utf-8") as f:
-            json.dump(contenido, f, indent=2)
+        ruta_principal = None
 
-        self.log(f"💾 File guardado exitosamente: {ruta_json} ({len(self.zonas)} zonas)")
-        return ruta_json
+        # 1. Guardar al mismo nivel del video con el mismo nombre del video
+        if vpath and os.path.exists(vpath):
+            video_dir = os.path.dirname(os.path.abspath(vpath))
+            base_name = os.path.splitext(os.path.basename(vpath))[0]
+            ruta_principal = os.path.join(video_dir, f"{base_name}_zonas.json")
+            with open(ruta_principal, "w", encoding="utf-8") as f:
+                json.dump(contenido, f, indent=2)
+            self.log(f"💾 File guardado junto al video: {ruta_principal} ({len(self.zonas)} zonas)")
+
+        # 2. Guardar también en la carpeta de salida para compatibilidad con la pipeline
+        ruta_salida = os.path.join(out_dir, f"zonas_{cam_id}.json")
+        with open(ruta_salida, "w", encoding="utf-8") as f:
+            json.dump(contenido, f, indent=2)
+        self.log(f"💾 File guardado en carpeta de salida: {ruta_salida}")
+
+        messagebox.showinfo("Guardado Exitoso", f"JSON de zonas guardado en:\n{ruta_principal or ruta_salida}")
+        return ruta_principal or ruta_salida
+
+    def buscar_y_cargar_json_zonas(self):
+        vpath = self.video_path.get()
+        initial_dir = os.path.dirname(os.path.abspath(vpath)) if vpath and os.path.exists(vpath) else os.getcwd()
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar JSON de Zonas Guardadas",
+            initialdir=initial_dir,
+            filetypes=[("Archivos JSON", "*.json")]
+        )
+        if ruta:
+            self.cargar_json_existente(ruta)
 
     def cargar_json_existente(self, ruta_json):
         try:
@@ -601,7 +705,7 @@ class RetailTrackerApp:
                     self.contador_zonas[t] += 1
             self.actualizar_lista_box_zonas()
             self.redibujar_canvas()
-            self.log(f"ℹ️ Zonas cargadas desde JSON existente: {len(self.zonas)} zonas")
+            self.log(f"ℹ️ Zonas cargadas desde JSON existente: {os.path.basename(ruta_json)} ({len(self.zonas)} zonas)")
         except Exception as e:
             self.log(f"Error al cargar JSON existente: {e}")
 
@@ -673,6 +777,8 @@ class RetailTrackerApp:
             return
 
         cap = cv2.VideoCapture(ruta)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         ret, frame = cap.read()
         cap.release()
         if ret:
@@ -680,7 +786,8 @@ class RetailTrackerApp:
             self.frame_ref = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self.h_ref, self.w_ref = self.frame_ref.shape[:2]
             self.redibujar_canvas_hom_ref()
-            self.log(f"🌐 Video Referencia cargado: {os.path.basename(ruta)} ({self.w_ref}x{self.h_ref} px)")
+            print(f"\n🌐 [VIDEO REFERENCIA SELECCIONADO]: {os.path.basename(ruta)} | {fps:.2f} FPS | Total frames: {total_frames}\n")
+            self.log(f"🌐 Video Referencia cargado: {os.path.basename(ruta)} | {fps:.2f} FPS ({self.w_ref}x{self.h_ref} px)")
 
     def cargar_video_hom_sec(self):
         ruta = filedialog.askopenfilename(title="Seleccionar Video de Cámara Secundaria", filetypes=[("Videos", "*.mp4 *.avi *.mkv *.mov")])
@@ -688,6 +795,8 @@ class RetailTrackerApp:
             return
 
         cap = cv2.VideoCapture(ruta)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         ret, frame = cap.read()
         cap.release()
         if ret:
@@ -695,7 +804,8 @@ class RetailTrackerApp:
             self.frame_sec = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self.h_sec, self.w_sec = self.frame_sec.shape[:2]
             self.redibujar_canvas_hom_sec()
-            self.log(f"🌐 Video Secundario cargado: {os.path.basename(ruta)} ({self.w_sec}x{self.h_sec} px)")
+            print(f"\n🌐 [VIDEO SECUNDARIO SELECCIONADO]: {os.path.basename(ruta)} | {fps:.2f} FPS | Total frames: {total_frames}\n")
+            self.log(f"🌐 Video Secundario cargado: {os.path.basename(ruta)} | {fps:.2f} FPS ({self.w_sec}x{self.h_sec} px)")
 
     def redibujar_canvas_hom_ref(self):
         if self.frame_ref is None:
@@ -838,251 +948,6 @@ class RetailTrackerApp:
         self.redibujar_canvas_hom_sec()
         self.actualizar_banner_instrucciones_hom()
         self.log("↩️ Deshecho el último clic de calibración.")
-
-    def abrir_modal_emparejamiento_gondolas(self):
-        cid_ref = self.cam_ref_id.get().strip() or "cam_04"
-        cid_sec = self.cam_sec_id.get().strip() or "cam_05"
-
-        if not self.zonas_hom_ref:
-            ruta_j = self.json_ref_path.get().strip() or os.path.join(self.carpeta_salida.get() or "", f"zonas_{cid_ref}.json")
-            if os.path.exists(ruta_j):
-                with open(ruta_j, "r", encoding="utf-8") as f:
-                    self.zonas_hom_ref = json.load(f).get("zones", [])
-
-        if not self.zonas_hom_sec:
-            ruta_j = self.json_sec_path.get().strip() or os.path.join(self.carpeta_salida.get() or "", f"zonas_{cid_sec}.json")
-            if os.path.exists(ruta_j):
-                with open(ruta_j, "r", encoding="utf-8") as f:
-                    self.zonas_hom_sec = json.load(f).get("zones", [])
-
-        if not self.zonas_hom_ref or not self.zonas_hom_sec:
-            messagebox.showwarning(
-                "Archivos de Zonas Necesarios",
-                "Por favor cargue o genere primero los archivos JSON de zonas para ambas cámaras utilizando "
-                "los botones '🏷️ JSON Zonas Ref' y '🏷️ JSON Zonas Sec'."
-            )
-            return
-
-        modal = tk.Toplevel(self.root)
-        modal.title("🛒 Selección y Emparejamiento de Góndolas (Multicámara)")
-        modal.geometry("880x640")
-        modal.configure(bg=self.colors["bg"])
-        modal.grab_set()
-
-        # Título e instrucciones
-        hdr_frame = ttk.Frame(modal, padding=12, style="Card.TFrame")
-        hdr_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        ttk.Label(
-            hdr_frame, text="🛒 Emparejamiento de Góndolas Coincidentes entre Cámaras",
-            style="Header.TLabel", background=self.colors["card"]
-        ).pack(anchor="w", pady=(0, 4))
-
-        ttk.Label(
-            hdr_frame,
-            text="Selecciona qué góndola/zona de la Cámara Secundaria corresponde a cuál de la Cámara de Referencia.\n"
-                 "Las góndolas que no se observen por el ángulo de la cámara se omitirán automáticamente.",
-            background=self.colors["card"], font=("Segoe UI", 9)
-        ).pack(anchor="w")
-
-        # Contenedor Central
-        mid_frame = ttk.Frame(modal, padding=10)
-        mid_frame.pack(fill=tk.BOTH, expand=True, padx=10)
-
-        # Panel Superior: Información de Góndolas Disponibles
-        info_cams = ttk.Frame(mid_frame, style="Card.TFrame", padding=10)
-        info_cams.pack(fill=tk.X, pady=(0, 10))
-
-        ids_ref = [z["id"] for z in self.zonas_hom_ref if "id" in z]
-        ids_sec = [z["id"] for z in self.zonas_hom_sec if "id" in z]
-
-        lbl_ref_info = ttk.Label(
-            info_cams, text=f"📷 Cámara Ref ({cid_ref}): {len(ids_ref)} góndolas detectadas ({', '.join(ids_ref)})",
-            background=self.colors["card"], font=("Segoe UI", 9, "bold"), foreground=self.colors["accent"]
-        )
-        lbl_ref_info.pack(anchor="w", pady=(0, 2))
-
-        lbl_sec_info = ttk.Label(
-            info_cams, text=f"📷 Cámara Sec ({cid_sec}): {len(ids_sec)} góndolas detectadas ({', '.join(ids_sec)})",
-            background=self.colors["card"], font=("Segoe UI", 9, "bold"), foreground=self.colors["warning"]
-        )
-        lbl_sec_info.pack(anchor="w")
-
-        # Seccion de Agregación de Pares
-        add_frame = ttk.Frame(mid_frame, style="Card.TFrame", padding=10)
-        add_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(add_frame, text="Agregar Par Coincidente:", background=self.colors["card"], font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 5))
-
-        ttk.Label(add_frame, text=f"Góndola Sec ({cid_sec}):", background=self.colors["card"]).grid(row=0, column=1, padx=(5, 2))
-        cb_sec = ttk.Combobox(add_frame, values=ids_sec, width=16, state="readonly")
-        cb_sec.grid(row=0, column=2, padx=(0, 10))
-        if ids_sec:
-            cb_sec.current(0)
-
-        ttk.Label(add_frame, text="↔️ Corresponde a Ref:", background=self.colors["card"]).grid(row=0, column=3, padx=(5, 2))
-        cb_ref = ttk.Combobox(add_frame, values=ids_ref, width=16, state="readonly")
-        cb_ref.grid(row=0, column=4, padx=(0, 10))
-        if ids_ref:
-            cb_ref.current(0)
-
-        # Tabla / Lista de Pares
-        list_frame = ttk.Frame(mid_frame, style="Card.TFrame", padding=10)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-        ttk.Label(list_frame, text="Góndolas Emparejadas Actuales (Usadas para Homografía):", background=self.colors["card"], font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 4))
-
-        lst_pares = tk.Listbox(list_frame, bg="#11111b", fg=self.colors["fg"], selectbackground=self.colors["accent"], font=("Consolas", 10), height=8)
-        lst_pares.pack(fill=tk.BOTH, expand=True, side=tk.LEFT, padx=(0, 10))
-
-        # Cargar pares actuales o pre-cargar coincidencias por nombre
-        temp_pares = list(self.emparejamiento_zonas)
-
-        def actualizar_lista_pares():
-            lst_pares.delete(0, tk.END)
-            for s_id, r_id in temp_pares:
-                lst_pares.insert(tk.END, f"  🔗  Góndola Sec [{s_id}]  <=========>  Góndola Ref [{r_id}]")
-
-        def fn_agregar_par():
-            s = cb_sec.get()
-            r = cb_ref.get()
-            if not s or not r:
-                return
-            # Evitar duplicados
-            if (s, r) not in temp_pares:
-                temp_pares.append((s, r))
-                actualizar_lista_pares()
-
-        def fn_auto_coincidentes():
-            temp_pares.clear()
-            for s in ids_sec:
-                if s in ids_ref:
-                    temp_pares.append((s, s))
-            actualizar_lista_pares()
-
-        def fn_eliminar_par():
-            sel = lst_pares.curselection()
-            if sel:
-                idx = sel[0]
-                temp_pares.pop(idx)
-                actualizar_lista_pares()
-
-        def fn_limpiar_pares():
-            temp_pares.clear()
-            actualizar_lista_pares()
-
-        btn_add = ttk.Button(add_frame, text="➕ Emparejar", command=fn_agregar_par, style="Flujo.TButton")
-        btn_add.grid(row=0, column=5, padx=(5, 0))
-
-        btn_box = ttk.Frame(list_frame, style="Card.TFrame")
-        btn_box.pack(side=tk.RIGHT, fill=tk.Y)
-
-        ttk.Button(btn_box, text="⚡ Auto (Mismo ID)", command=fn_auto_coincidentes, style="Gondola.TButton").pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(btn_box, text="🗑️ Eliminar Par", command=fn_eliminar_par).pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(btn_box, text="⚠️ Limpiar Todos", command=fn_limpiar_pares).pack(fill=tk.X)
-
-        if not temp_pares:
-            fn_auto_coincidentes()
-        else:
-            actualizar_lista_pares()
-
-        # Botones Inferiores de Confirmación
-        bot_frame = ttk.Frame(modal, padding=10)
-        bot_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-        def fn_guardar_y_calibrar():
-            if not temp_pares:
-                messagebox.showwarning("Sin Emparejamientos", "Debe agregar al menos un par de góndolas coincidentes para la calibración.")
-                return
-            self.emparejamiento_zonas = list(temp_pares)
-            modal.destroy()
-            self.redibujar_canvas_hom_ref()
-            self.redibujar_canvas_hom_sec()
-            self.log(f"🛒 Emparejamiento de Góndolas guardado: {len(self.emparejamiento_zonas)} pares ({self.emparejamiento_zonas})")
-            self.autocalibrar_homografia_por_zonas()
-
-        btn_save = ttk.Button(bot_frame, text="✅ APLICAR Y CALIBRAR HOMOGRAFÍA", style="Accent.TButton", command=fn_guardar_y_calibrar)
-        btn_save.pack(side=tk.RIGHT, padx=(5, 0), ipady=4)
-
-        btn_cancel = ttk.Button(bot_frame, text="❌ Cancelar", command=modal.destroy)
-        btn_cancel.pack(side=tk.RIGHT)
-
-    def autocalibrar_homografia_por_zonas(self):
-        cid_ref = self.cam_ref_id.get().strip() or "cam_04"
-        cid_sec = self.cam_sec_id.get().strip() or "cam_05"
-
-        zonas_r = self.zonas_hom_ref
-        zonas_s = self.zonas_hom_sec
-
-        if not zonas_r:
-            ruta_j = self.json_ref_path.get().strip() or os.path.join(self.carpeta_salida.get() or "", f"zonas_{cid_ref}.json")
-            if os.path.exists(ruta_j):
-                with open(ruta_j, "r", encoding="utf-8") as f:
-                    zonas_r = json.load(f).get("zones", [])
-                    self.zonas_hom_ref = zonas_r
-
-        if not zonas_s:
-            ruta_j = self.json_sec_path.get().strip() or os.path.join(self.carpeta_salida.get() or "", f"zonas_{cid_sec}.json")
-            if os.path.exists(ruta_j):
-                with open(ruta_j, "r", encoding="utf-8") as f:
-                    zonas_s = json.load(f).get("zones", [])
-                    self.zonas_hom_sec = zonas_s
-
-        if not zonas_r or not zonas_s:
-            messagebox.showwarning(
-                "Archivos de Zonas no cargados",
-                f"Cargue los archivos JSON de zonas usando los botones '🏷️ JSON Zonas Ref' y '🏷️ JSON Zonas Sec' "
-                f"o guarde las zonas para ambas cámaras con la Pestaña 1."
-            )
-            return
-
-        try:
-            if self.emparejamiento_zonas:
-                H, error_medio, coincidiendo = fusion_mod.calcular_homografia_por_emparejamiento_zonas(zonas_s, zonas_r, self.emparejamiento_zonas)
-                desc_pares = f"{len(coincidiendo)} pares seleccionados: {coincidiendo}"
-            else:
-                H, error_medio, coincidiendo = fusion_mod.calcular_homografia_por_ids_zonas(zonas_s, zonas_r)
-                desc_pares = f"{len(coincidiendo)} zonas con el mismo ID: {coincidiendo}"
-
-            self.puntos_hom_ref = []
-            self.puntos_hom_sec = []
-
-            dict_ref = {z["id"]: z["polygon"] for z in zonas_r if "polygon" in z and "id" in z}
-            dict_sec = {z["id"]: z["polygon"] for z in zonas_s if "polygon" in z and "id" in z}
-
-            if self.emparejamiento_zonas:
-                for s_id, r_id in coincidiendo:
-                    if s_id in dict_sec and r_id in dict_ref:
-                        poly_r = dict_ref[r_id]
-                        poly_s = dict_sec[s_id]
-                        for p in poly_r[:4]:
-                            self.puntos_hom_ref.append(p)
-                        for p in poly_s[:4]:
-                            self.puntos_hom_sec.append(p)
-            else:
-                for zid in coincidiendo:
-                    poly_r = dict_ref[zid]
-                    poly_s = dict_sec[zid]
-                    for p in poly_r[:4]:
-                        self.puntos_hom_ref.append(p)
-                    for p in poly_s[:4]:
-                        self.puntos_hom_sec.append(p)
-
-            self.redibujar_canvas_hom_ref()
-            self.redibujar_canvas_hom_sec()
-            self.actualizar_banner_instrucciones_hom()
-
-            self.log(f"🏷️ Autocalibración por Góndolas Exitosa ({desc_pares}). Error medio: {error_medio:.1f}px")
-
-            messagebox.showinfo(
-                "¡Autocalibración por Góndolas Exitosa!",
-                f"Se emparejaron exitosamente las góndolas/zonas:\n{desc_pares}\n\n"
-                f"Error medio de reproyección: {error_medio:.1f} px\n\n"
-                f"Ahora puedes presionar '📐 GENERAR MAPAS EN homografia/'"
-            )
-
-        except Exception as e:
-            messagebox.showerror("Error de Autocalibración por Góndolas", str(e))
 
     def limpiar_puntos_homografia_lado_a_lado(self):
         self.puntos_hom_ref = []
@@ -1241,14 +1106,17 @@ class RetailTrackerApp:
         orig_stdout = sys.stdout
         sys.stdout = QueueLogger(self.log_queue)
         try:
+            disp_val = "cuda" if "GPU" in self.dispositivo_opt.get() else "cpu"
             extraer_mod.modo_guardar(
                 video_path=video_path,
                 camera_id=camera_id,
-                modelo_path="yolo26n-pose.pt",
+                modelo_path=self.obtener_ruta_modelo_absoluta(),
+                imgsz=self.imgsz.get(),
                 salida_parquet=salida_parquet,
                 carpeta_salida=carpeta_salida,
                 frame_skip=self.frame_skip.get(),
-                conf=self.conf_thresh.get()
+                conf=self.conf_thresh.get(),
+                dispositivo=disp_val
             )
             self.log_queue.put(("done", salida_parquet))
         except Exception as e:
@@ -1354,9 +1222,11 @@ class RetailTrackerApp:
                 else:
                     self.log("  [3/3] ⏩ Omisión de video anotado por configuración del Checkbox.")
 
-                self.root.after(0, lambda: self.post_procesamiento_completado(out_dir))
+                self.root.after(0, lambda d=out_dir: self.post_procesamiento_completado(d))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error de Procesamiento", str(e)))
+                err_msg = str(e)
+                self.log(f"❌ Error en post-procesamiento: {err_msg}")
+                self.root.after(0, lambda msg=err_msg: messagebox.showerror("Error de Procesamiento", msg))
 
         t_post = threading.Thread(target=worker_post_procesamiento, daemon=True)
         t_post.start()

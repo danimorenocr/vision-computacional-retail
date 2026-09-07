@@ -26,6 +26,7 @@ desktop.ini
 
 # Pesos de Modelos (YOLO / PyTorch / ONNX)
 *.pt
+!yolo26n-pose.pt
 *.onnx
 *.engine
 *.tflite
