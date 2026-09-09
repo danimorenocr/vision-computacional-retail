@@ -333,11 +333,6 @@ def generar_mapa_permanencia_continuo(df_val, fondo, zonas_exclusion, salida_png
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)
 
-    n_personas = df_val["track_id"].nunique()
-    cv2.rectangle(resultado, (0, 0), (w, 38), (15, 15, 15), -1)
-    cv2.putText(resultado, f"1. MAPA DE PASILLOS (PERMANENCIA) | {n_personas} personas",
-                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
-
     cv2.imwrite(salida_png, resultado)
     print(f"  [1/6] Mapa de pasillos guardado en: {salida_png}")
     return resultado
@@ -397,11 +392,6 @@ def generar_mapa_gondolas_exclusivo(df_val, fondo, zonas_validas, zonas_exclusio
 
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)
-
-    n_alcances = len(puntos_contacto_manos)
-    cv2.rectangle(resultado, (0, 0), (w, 38), (15, 15, 15), -1)
-    cv2.putText(resultado, f"2. MAPA EXCLUSIVO DE GONDOLAS (MANOS) | {n_alcances} contactos",
-                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
 
     cv2.imwrite(salida_png, resultado)
     print(f"  [2/6] Mapa exclusivo de góndolas guardado en: {salida_png}")
@@ -468,11 +458,6 @@ def generar_mapa_integrado_pasillos_y_gondolas(df_val, fondo, zonas_validas, zon
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)
 
-    n_personas = df_val["track_id"].nunique()
-    cv2.rectangle(resultado, (0, 0), (w, 38), (15, 15, 15), -1)
-    cv2.putText(resultado, f"3. MAPA UNIFICADO (PASILLOS + GONDOLAS) | {n_personas} personas | {len(puntos_contacto_manos)} alcances",
-                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
-
     cv2.imwrite(salida_png, resultado)
     print(f"  [3/6] Mapa unificado de pasillos + góndolas guardado en: {salida_png}")
     return resultado
@@ -505,10 +490,6 @@ def generar_mapa_trayectorias(df_val, fondo, zonas_exclusion, salida_png):
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)
 
-    cv2.rectangle(resultado, (0, 0), (w := fondo.shape[1], 38), (15, 15, 15), -1)
-    cv2.putText(resultado, f"4. TRAYECTORIAS DE RECORRIDO | {n_personas} clientes",
-                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
-
     cv2.imwrite(salida_png, resultado)
     print(f"  [4/6] Mapa de trayectorias guardado en: {salida_png}")
     return resultado
@@ -538,10 +519,6 @@ def generar_mapa_combinado(df_val, img_heatmap, zonas_exclusion, salida_png):
 
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)
-
-    cv2.rectangle(resultado, (0, 0), (w := resultado.shape[1], 38), (15, 15, 15), -1)
-    cv2.putText(resultado, f"5. PERMANENCIA + TRAYECTORIAS COMBINADAS | {n_personas} personas",
-                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
 
     cv2.imwrite(salida_png, resultado)
     print(f"  [5/6] Mapa combinado guardado en: {salida_png}")
@@ -650,10 +627,6 @@ def generar_mapa_zonas(df_val, fondo, zonas_validas, zonas_exclusion, salida_png
 
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)
-
-    cv2.rectangle(resultado, (0, 0), (w, 38), (15, 15, 15), -1)
-    cv2.putText(resultado, f"6. PERMANENCIA E INTERACCION DE MANOS | {len(stats_zonas)} zonas analizadas",
-                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
 
     cv2.imwrite(salida_png, resultado)
     print(f"  [6/6] Mapa de interacción por zonas guardado en: {salida_png}")
