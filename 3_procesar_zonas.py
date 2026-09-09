@@ -15,6 +15,7 @@ Uso:
 """
 
 import os
+import sys
 import cv2
 import json
 import argparse
@@ -22,6 +23,14 @@ import numpy as np
 import pandas as pd
 import requests
 from datetime import datetime, timezone
+
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 
 
 def punto_en_zona(x, y, poligono):
@@ -72,6 +81,63 @@ def calcular_dwell_zonas_flujo(df, zonas_flujo):
     if not filas_dwell:
         return pd.DataFrame(columns=["track_id", "zona", "inicio_s", "fin_s", "duracion_s"])
     return pd.DataFrame(filas_dwell)
+
+
+def calcular_dwell_gondolas(df, zonas_interaccion, df_eventos=None):
+    """
+    Calcula la permanencia y visitantes únicos frente a cada góndola/estantería.
+    Usa primero los eventos confirmados de interacción (manos/alcances). Para zonas sin toques,
+    analiza la proximidad física del cliente a la góndola por distancia de pies/centro.
+    """
+    filas_dwell = []
+
+    # 1. Desde eventos confirmados de interacción
+    if df_eventos is not None and not df_eventos.empty and "zona" in df_eventos.columns:
+        for (t_id, z_id), grp in df_eventos.groupby(["track_id", "zona"]):
+            t_ini = float(grp["inicio_s"].min())
+            t_fin = float(grp["fin_s"].max())
+            dur_interaccion = float(grp["duracion_s"].sum())
+            dur_total = max(dur_interaccion, t_fin - t_ini)
+            filas_dwell.append({
+                "track_id": t_id,
+                "zona": z_id,
+                "inicio_s": t_ini,
+                "fin_s": t_fin,
+                "duracion_s": round(max(dur_total, 1.0), 2)
+            })
+
+    # 2. Para zonas de interacción que no hayan tenido alcances directos, estimar por proximidad
+    zonas_con_dwell = set(f["zona"] for f in filas_dwell)
+    for z in zonas_interaccion:
+        z_id = z.get("id", "")
+        if not z_id or z_id in zonas_con_dwell:
+            continue
+        pts = np.array(z.get("polygon", z.get("poligono", [])), dtype=np.float32)
+        if len(pts) < 3:
+            continue
+        for track_id, grupo in df.groupby("track_id"):
+            near_frames = []
+            for _, row in grupo.iterrows():
+                xf, yf = row.get("x_foot", np.nan), row.get("y_foot", np.nan)
+                if not np.isnan(xf) and not np.isnan(yf):
+                    d = cv2.pointPolygonTest(pts, (float(xf), float(yf)), True)
+                    if d >= -160.0:
+                        near_frames.append(float(row["timestamp_s"]))
+            if len(near_frames) >= 5:
+                dur = near_frames[-1] - near_frames[0]
+                if dur >= 0.5:
+                    filas_dwell.append({
+                        "track_id": track_id,
+                        "zona": z_id,
+                        "inicio_s": near_frames[0],
+                        "fin_s": near_frames[-1],
+                        "duracion_s": round(dur, 2)
+                    })
+
+    if not filas_dwell:
+        return pd.DataFrame(columns=["track_id", "zona", "inicio_s", "fin_s", "duracion_s"])
+    return pd.DataFrame(filas_dwell)
+
 
 
 def evaluar_cambio_repisa_sin_oclusion(video_cap, pts_poligono, frame_pre_limpio, frame_post_limpio):
@@ -454,27 +520,8 @@ def main(parquet_path, zonas_json_path, video_path=None, min_votacion=6, carpeta
     print("=" * 60)
     print(f"Zonas de pasillo: {len(zonas_flujo)} | Zonas de góndola: {len(zonas_interaccion)}")
 
-    # 1. Permanencia en Pasillos (Ranking Calientes/Frías)
-    if zonas_flujo:
-        dwell_df = calcular_dwell_zonas_flujo(df, zonas_flujo)
-        path_dwell = os.path.join(carpeta_salida, "dwell_por_zona.parquet") if carpeta_salida else "dwell_por_zona.parquet"
-        dwell_df.to_parquet(path_dwell, index=False)
-
-        if len(dwell_df) > 0 and "zona" in dwell_df.columns:
-            resumen_flujo = dwell_df.groupby("zona").agg(
-                visitantes_unicos=("track_id", "nunique"),
-                tiempo_total_s=("duracion_s", "sum"),
-                tiempo_promedio_s=("duracion_s", "mean"),
-            ).sort_values("tiempo_total_s", ascending=False)
-
-            print("\n--- 🟢 Ranking de Zonas de Pasillo (Permanencia) ---")
-            print(resumen_flujo)
-            path_ranking = os.path.join(carpeta_salida, "ranking_zonas.csv") if carpeta_salida else "ranking_zonas.csv"
-            resumen_flujo.to_csv(path_ranking)
-        else:
-            print("\n--- 🟢 No se registraron permanencias continuas en las zonas de pasillo ---")
-
-    # 2. Clasificación PICK-UP vs PUT-BACK en Góndolas
+    # 1. Clasificación PICK-UP vs PUT-BACK en Góndolas
+    df_eventos = None
     if zonas_interaccion:
         df_eventos, df_resumen_gondolas = clasificar_pickup_putback(
             df, zonas_interaccion, video_path=video_path, min_votacion=min_votacion
@@ -494,10 +541,42 @@ def main(parquet_path, zonas_json_path, video_path=None, min_votacion=6, carpeta
     else:
         print("No hay zonas de góndola definidas.")
 
+    # 2. Permanencia y Flujo (Pasillos y Góndolas)
+    dwell_total_dfs = []
+    if zonas_flujo:
+        df_dwell_flujo = calcular_dwell_zonas_flujo(df, zonas_flujo)
+        if len(df_dwell_flujo) > 0:
+            dwell_total_dfs.append(df_dwell_flujo)
+
+    if zonas_interaccion:
+        df_dwell_gondolas = calcular_dwell_gondolas(df, zonas_interaccion, df_eventos)
+        if len(df_dwell_gondolas) > 0:
+            dwell_total_dfs.append(df_dwell_gondolas)
+
+    dwell_df_combinado = pd.concat(dwell_total_dfs, ignore_index=True) if dwell_total_dfs else pd.DataFrame(columns=["track_id", "zona", "inicio_s", "fin_s", "duracion_s"])
+
+    if len(dwell_df_combinado) > 0 and "zona" in dwell_df_combinado.columns:
+        path_dwell = os.path.join(carpeta_salida, "dwell_por_zona.parquet") if carpeta_salida else "dwell_por_zona.parquet"
+        dwell_df_combinado.to_parquet(path_dwell, index=False)
+
+        resumen_flujo = dwell_df_combinado.groupby("zona").agg(
+            visitantes_unicos=("track_id", "nunique"),
+            tiempo_total_s=("duracion_s", "sum"),
+            tiempo_promedio_s=("duracion_s", "mean"),
+        ).sort_values("tiempo_total_s", ascending=False).round(2)
+
+        print("\n--- 🟢 Ranking de Zonas y Permanencia (Flujo y Góndolas) ---")
+        print(resumen_flujo)
+        path_ranking = os.path.join(carpeta_salida, "ranking_zonas.csv") if carpeta_salida else "ranking_zonas.csv"
+        resumen_flujo.to_csv(path_ranking)
+        print(f"\n✅ Ranking de Permanencia exportado a: {path_ranking}")
+    else:
+        print("\n--- 🟢 No se registraron permanencias continuas en las zonas analizadas ---")
+
     print("=" * 60 + "\n")
     
-    df_eventos_enviar = df_eventos if 'df_eventos' in locals() else None
-    dwell_df_enviar = dwell_df if 'dwell_df' in locals() else None
+    df_eventos_enviar = df_eventos if df_eventos is not None else None
+    dwell_df_enviar = dwell_df_combinado if len(dwell_df_combinado) > 0 else None
     enviar_eventos_backend(df_eventos_enviar, dwell_df_enviar, tenant_id, store_id, api_url)
 
 
