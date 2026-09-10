@@ -24,6 +24,12 @@ import pandas as pd
 import requests
 from datetime import datetime, timezone
 
+try:
+    import supervision as sv
+    HAS_SUPERVISION = True
+except ImportError:
+    HAS_SUPERVISION = False
+
 if hasattr(sys.stdout, 'reconfigure'):
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -33,11 +39,17 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 
 
-def punto_en_zona(x, y, poligono):
+def punto_en_zona(x, y, poligono, sv_zone=None):
     if poligono is None or len(poligono) < 3:
         return False
     if np.isnan(x) or np.isnan(y):
         return False
+    if sv_zone is not None and HAS_SUPERVISION:
+        try:
+            pt_det = sv.Detections(xyxy=np.array([[x - 1, y - 1, x + 1, y + 1]]))
+            return bool(sv_zone.trigger(pt_det)[0])
+        except Exception:
+            pass
     return cv2.pointPolygonTest(np.array(poligono, dtype=np.float32), (float(x), float(y)), False) >= 0
 
 
@@ -177,12 +189,12 @@ def evaluar_cambio_repisa_sin_oclusion(video_cap, pts_poligono, frame_pre_limpio
     return float(score_cambio)
 
 
-def es_alcance_real_a_gondola(row, pts_poligono, max_dist_pies_px=220.0):
+def es_alcance_real_a_gondola(row, pts_poligono, sv_zone=None, max_dist_pies_px=350.0):
     """
-    Filtro Biomecánico Anti-Ruido 2D:
-    1. Proximidad de Pies: Los pies deben estar relativamente cerca o dentro del polígono.
-    2. Extensión del Brazo: La muñeca debe estar extendida fuera de reposo vertical de marcha.
-    3. Orientación del Pecho / Mirada: El torso y rostro deben estar orientados hacia la góndola.
+    Filtro Biomecánico Permisivo Anti-Ruido 2D con Roboflow Supervision (PolygonZone):
+    1. Presencia de Muñeca: Verifica si la mano está dentro o muy cercana al área de la góndola.
+    2. Proximidad de Pies Flexible: Permite que clientes altos, inclinados o de lado realicen alcances.
+    3. Validación de Extensión: Evita descartar alcances rápidos o laterales.
     """
     if pts_poligono is None or len(pts_poligono) < 3:
         return False
@@ -190,28 +202,27 @@ def es_alcance_real_a_gondola(row, pts_poligono, max_dist_pies_px=220.0):
     lw_x, lw_y = row.get("left_wrist_x", np.nan), row.get("left_wrist_y", np.nan)
     rw_x, rw_y = row.get("right_wrist_x", np.nan), row.get("right_wrist_y", np.nan)
 
-    lw_in = punto_en_zona(lw_x, lw_y, pts_poligono)
-    rw_in = punto_en_zona(rw_x, rw_y, pts_poligono)
+    lw_in = punto_en_zona(lw_x, lw_y, pts_poligono, sv_zone=sv_zone)
+    rw_in = punto_en_zona(rw_x, rw_y, pts_poligono, sv_zone=sv_zone)
 
     if not (lw_in or rw_in):
         return False
 
-    # 1. Proximidad de Pies
+    # 1. Proximidad de Pies (Umbral flexible ampliado a 350px para inclinaciones del cuerpo)
     xf, yf = row.get("x_foot", np.nan), row.get("y_foot", np.nan)
-    dist_pies = 0.0
     if not np.isnan(xf) and not np.isnan(yf):
         dist_pies = cv2.pointPolygonTest(np.array(pts_poligono, dtype=np.float32), (float(xf), float(yf)), True)
         if dist_pies < 0 and abs(dist_pies) > max_dist_pies_px:
             return False
 
-    # 2. Extensión del Brazo (mano no pegada a la cadera en reposo al caminar)
+    # 2. Extensión del Brazo (Mano separada de la cadera al menos 15px)
     lh_x, lh_y = row.get("left_hip_x", np.nan), row.get("left_hip_y", np.nan)
     rh_x, rh_y = row.get("right_hip_x", np.nan), row.get("right_hip_y", np.nan)
 
     valid_left = False
     if lw_in and not np.isnan(lh_x) and not np.isnan(lh_y):
         dist_mano_cadera = np.sqrt((lw_x - lh_x)**2 + (lw_y - lh_y)**2)
-        if dist_mano_cadera > 30.0:
+        if dist_mano_cadera > 15.0:
             valid_left = True
     elif lw_in:
         valid_left = True
@@ -219,53 +230,15 @@ def es_alcance_real_a_gondola(row, pts_poligono, max_dist_pies_px=220.0):
     valid_right = False
     if rw_in and not np.isnan(rh_x) and not np.isnan(rh_y):
         dist_mano_cadera = np.sqrt((rw_x - rh_x)**2 + (rw_y - rh_y)**2)
-        if dist_mano_cadera > 30.0:
+        if dist_mano_cadera > 15.0:
             valid_right = True
     elif rw_in:
         valid_right = True
 
-    if not (valid_left or valid_right):
-        return False
-
-    # 3. Orientación del Pecho y Rostro
-    ls_x, ls_y = row.get("left_shoulder_x", np.nan), row.get("left_shoulder_y", np.nan)
-    rs_x, rs_y = row.get("right_shoulder_x", np.nan), row.get("right_shoulder_y", np.nan)
-
-    if not np.isnan(ls_x) and not np.isnan(rs_x):
-        g_center = np.mean(pts_poligono, axis=0)
-        body_center = np.array([(ls_x + rs_x) / 2.0, (ls_y + rs_y) / 2.0])
-        vec_to_gondola = g_center - body_center
-        norm_to_g = np.linalg.norm(vec_to_gondola)
-
-        if norm_to_g > 0:
-            vec_to_gondola /= norm_to_g
-            vec_hombros = np.array([rs_x - ls_x, rs_y - ls_y])
-            norm_h = np.linalg.norm(vec_hombros)
-            if norm_h > 0:
-                vec_hombros /= norm_h
-                vec_pecho = np.array([-vec_hombros[1], vec_hombros[0]])
-                dot = abs(np.dot(vec_pecho, vec_to_gondola))
-                if dot < 0.12 and dist_pies < -90:
-                    return False
-
-    # 4. Orientación de Mirada (si hay keypoints de rostro)
-    nose_x = row.get("nose_x", np.nan)
-    le_x, re_x = row.get("left_eye_x", np.nan), row.get("right_eye_x", np.nan)
-
-    if not np.isnan(nose_x) and not np.isnan(le_x) and not np.isnan(re_x):
-        eye_center_x = (le_x + re_x) / 2.0
-        gaze_dx = nose_x - eye_center_x
-        g_center_x = np.mean(pts_poligono[:, 0])
-        body_x = (ls_x + rs_x) / 2.0 if not np.isnan(ls_x) else xf
-        if not np.isnan(body_x):
-            dir_to_gondola_x = g_center_x - body_x
-            if (gaze_dx * dir_to_gondola_x < -15.0) and dist_pies < -50:
-                return False
-
-    return True
+    return valid_left or valid_right
 
 
-def clasificar_pickup_putback(df, zonas_interaccion, video_path=None, min_votacion=6):
+def clasificar_pickup_putback(df, zonas_interaccion, video_path=None, min_votacion=3):
     """
     1. Votación Temporal: confirma el alcance solo si la señal se mantiene durante min_votacion frames seguidos.
     2. Filtro Biomecánico Anti-Ruido 2D: valida proximidad de pies, extensión del brazo y orientación del torso/mirada.
@@ -278,16 +251,23 @@ def clasificar_pickup_putback(df, zonas_interaccion, video_path=None, min_votaci
         pts = np.array(zona["polygon"], dtype=np.int32)
         zona_id = zona["id"]
 
+        sv_zone = None
+        if HAS_SUPERVISION and len(pts) >= 3:
+            try:
+                sv_zone = sv.PolygonZone(polygon=pts)
+            except Exception:
+                sv_zone = None
+
         for track_id, grupo in df.groupby("track_id"):
             grupo = grupo.sort_values("frame_idx").reset_index(drop=True)
 
-            # 1. Votación Temporal de Presencia de Manos con Filtro Biomecánico
+            # 1. Votación Temporal de Presencia de Manos con Filtro Biomecánico y Supervision
             votos_consecutivos = 0
             tolerancia_ausencia = 0
             inicio_idx = None
 
             for i, r in grupo.iterrows():
-                mano_presente = es_alcance_real_a_gondola(r, pts)
+                mano_presente = es_alcance_real_a_gondola(r, pts, sv_zone=sv_zone)
 
                 if mano_presente:
                     if votos_consecutivos == 0:

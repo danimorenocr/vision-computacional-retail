@@ -1,11 +1,13 @@
 """
-Generador de Video Anotado de Analítica Retail: Visualización completa con Zonas, Pose,
-Alcance de Manos a Repisas y Renderizado Visual de PICK-UP vs PUT-BACK (Rechazo).
+Generador de Video Anotado Retail con Blur YuNet (Sin Frame Skip, Primeros 15 Segundos).
 
-Guarda automáticamente en la carpeta: videos_anotados/
+Procesa cuadro a cuadro (frame_skip=1) los primeros 15 segundos de un video,
+aplicando la red neuronal YuNet (cv2.FaceDetectorYN) para detección y difuminado
+elíptico continuo de rostros (cumplimiento Ley 1581 de protección de datos).
 
 Uso:
-  python anotar_video.py --video clip_test.mp4 --parquet datos_parquet/tracking_cam_01.parquet --zonas zonas_cam_01.json
+  python anotar_video_yunet_15s.py --video clip_test.mp4 --parquet datos_parquet/tracking_clip_test.parquet
+  python anotar_video_yunet_15s.py --video clip_test.mp4 --max-segundos 15
 """
 
 import os
@@ -14,6 +16,7 @@ import json
 import argparse
 import colorsys
 import importlib
+import urllib.request
 import numpy as np
 import pandas as pd
 
@@ -43,13 +46,8 @@ ESQUELETO_CUERPO = [
 def format_mmss(segundos):
     m = int(segundos // 60)
     s = int(segundos % 60)
-    return f"{m:02d}:{s:02d}"
-
-
-def punto_en_poligono(x, y, poligono):
-    if np.isnan(x) or np.isnan(y):
-        return False
-    return cv2.pointPolygonTest(np.array(poligono, dtype=np.float32), (float(x), float(y)), False) >= 0
+    ms = int((segundos % 1) * 10)
+    return f"{m:02d}:{s:02d}.{ms}"
 
 
 def color_para_id(track_id):
@@ -66,14 +64,13 @@ def obtener_detector_yunet(model_path="face_detection_yunet_2023mar.onnx"):
     Descarga automáticamente el modelo .onnx si no existe localmente.
     """
     if not os.path.exists(model_path):
-        import urllib.request
         url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
         print(f"Descargando modelo YuNet desde {url}...")
         try:
             urllib.request.urlretrieve(url, model_path)
-            print("✅ Modelo YuNet descargado con éxito.")
+            print("[OK] Modelo YuNet descargado con exito.")
         except Exception as e:
-            print(f"⚠️ Error al descargar YuNet: {e}")
+            print(f"[WARN] Error al descargar YuNet: {e}")
             return None
 
     try:
@@ -87,17 +84,62 @@ def obtener_detector_yunet(model_path="face_detection_yunet_2023mar.onnx"):
         )
         return detector
     except Exception as e:
-        print(f"⚠️ No se pudo inicializar cv2.FaceDetectorYN: {e}")
+        print(f"[WARN] No se pudo inicializar cv2.FaceDetectorYN: {e}")
         return None
 
 
-def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="videos_anotados", salida_filename=None, blur_faces=True, yunet_model_path="face_detection_yunet_2023mar.onnx"):
+def buscar_o_generar_parquet(video_path, parquet_path=None):
+    """
+    Busca un archivo Parquet existente o ejecuta la extracción con frame_skip=1 (sin salto de cuadros).
+    """
+    if parquet_path and os.path.exists(parquet_path):
+        return parquet_path
+
+    nombre_base = os.path.splitext(os.path.basename(video_path))[0]
+    candidatos = [
+        os.path.join("datos_parquet", f"tracking_{nombre_base}.parquet"),
+        os.path.join("datos_parquet", f"{nombre_base}.parquet"),
+        os.path.join("datos_parquet", f"tracking_cam_01.parquet")
+    ]
+    for c in candidatos:
+        if os.path.exists(c):
+            print(f"[INFO] Usando archivo Parquet encontrado: {c}")
+            return c
+
+    print(f"[INIT] No se proporciono Parquet. Ejecutando extraccion sin frame skip (frame_skip=1)...")
+    try:
+        mod_extraer = importlib.import_module("1_extraer_datos")
+        salida_p = os.path.join("datos_parquet", f"tracking_{nombre_base}_fskip1.parquet")
+        df_res = mod_extraer.modo_guardar(
+            video_path=video_path,
+            camera_id="cam_01",
+            frame_skip=1,
+            salida_parquet=salida_p
+        )
+        return salida_p
+    except Exception as e:
+        print(f"[WARN] Error al extraer datos tracking: {e}")
+        return None
+
+
+def anotar_video_yunet_15s(
+    video_path,
+    parquet_path=None,
+    zonas_path=None,
+    carpeta_salida="videos_anotados",
+    salida_filename=None,
+    max_segundos=15.0,
+    blur_faces=True,
+    yunet_model_path="face_detection_yunet_2023mar.onnx"
+):
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"No se encontró el video: {video_path}")
-    if not os.path.exists(parquet_path):
-        raise FileNotFoundError(f"No se encontró el archivo Parquet: {parquet_path}")
 
-    df = pd.read_parquet(parquet_path)
+    parquet_valido = buscar_o_generar_parquet(video_path, parquet_path)
+    if not parquet_valido or not os.path.exists(parquet_valido):
+        raise FileNotFoundError(f"No se encontró ni se pudo generar el archivo Parquet para: {video_path}")
+
+    df = pd.read_parquet(parquet_valido)
     os.makedirs(carpeta_salida, exist_ok=True)
 
     # Cargar Zonas si están disponibles
@@ -120,53 +162,48 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                 else:
                     zonas_flujo.append({"id": z.get("id", "pasillo"), "polygon": pts})
 
-    # Cargar / Ejecutar Clasificador PICK-UP vs PUT-BACK
-    df_eventos = pd.DataFrame()
-    try:
-        procesar_mod = importlib.import_module("3_procesar_zonas")
-        df_eventos, _ = procesar_mod.clasificar_pickup_putback(
-            df, zonas_interaccion, video_path=video_path, min_votacion=6
-        )
-    except Exception as e:
-        print(f"Aviso: No se pudo ejecutar clasificador de zonas ({e}), procediendo con anotación básica.")
-
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duracion_total_s = total_frames / fps if total_frames > 0 else 1.0
+    total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Limitar strictly a los primeros max_segundos (default 15s)
+    max_frames = int(round(fps * max_segundos))
+    frames_a_procesar = min(total_frames_video, max_frames)
+    duracion_proc_s = frames_a_procesar / fps
 
     if salida_filename is None:
         nombre_base = os.path.splitext(os.path.basename(video_path))[0]
-        salida_filename = f"anotado_{nombre_base}.mp4"
+        salida_filename = f"anotado_15s_yunet_{nombre_base}.mp4"
 
     salida_path = os.path.join(carpeta_salida, salida_filename)
     out = cv2.VideoWriter(salida_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
-    df_por_frame = {k: v for k, v in df.groupby("frame_idx")}
+    df_filtrado = df[df["frame_idx"] < max_frames]
+    df_por_frame = {k: v for k, v in df_filtrado.groupby("frame_idx")}
 
-    print("\n" + "=" * 60)
-    print("🎥 GENERANDO VIDEO ANOTADO CON ETIQUETADO DE PICK-UP Y PUT-BACK")
-    print("=" * 60)
-    print(f"Video origen: {video_path} ({total_frames} frames | {format_mmss(duracion_total_s)})")
-    print(f"Eventos clasificados: {len(df_eventos)} (Pick-Ups / Put-Backs)")
-    print(f"Guardando video anotado en carpeta: {os.path.abspath(salida_path)}")
+    print("\n" + "=" * 65)
+    print("[VIDEO] PROCESANDO VIDEO (PRIMEROS 15 SEGUNDOS | FRAME SKIP = 1)")
+    print("=" * 65)
+    print(f"Video origen: {video_path}")
+    print(f"Procesando cuadros: 0 a {frames_a_procesar} ({duracion_proc_s:.1f}s a {fps:.1f} FPS sin salto de frames)")
+    print(f"Guardando en: {os.path.abspath(salida_path)}")
 
     # Detector de Rostros YuNet (cv2.FaceDetectorYN)
     yunet_detector = obtener_detector_yunet(yunet_model_path) if blur_faces else None
     if blur_faces and yunet_detector is not None:
-        print("👤 Detector YuNet (cv2.FaceDetectorYN) activado para difuminado biométrico de rostros.")
+        print("[FACE] Detector YuNet (cv2.FaceDetectorYN) activado para difuminado de rostros.")
 
-    # Memoria temporal para suavizado y persistencia continua de rostros
+    # Memoria temporal para suavizado espacial (EMA) y continuidad sin parpadeo
     # Dict: track_id -> {"roi": (fx1, fy1, fx2, fy2), "last_seen": frame_idx}
     estado_rostros = {}
     alpha_suavizado = 0.65  # Factor EMA más reactivo para acompañar movimiento sin rezagarse
-    max_persistencia_frames = int(fps * 0.85)  # Retener blur durante 0.85s si hay saltos de frames
+    max_persistencia_frames = int(fps * 0.85)  # Persistencia de blur por 0.85s
 
     frame_idx = 0
 
-    while True:
+    while frame_idx < frames_a_procesar:
         ret, frame = cap.read()
         if not ret:
             break
@@ -189,7 +226,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
 
         frame = cv2.addWeighted(overlay, 0.25, frame, 0.75, 0)
 
-        # 2. Actualizar Coordenadas de Rostros para las Detecciones del Frame Actual
+        # 2. Detección de Rostros con YuNet cuadro a cuadro (frame_skip=1)
         if frame_idx in df_por_frame:
             for _, row in df_por_frame[frame_idx].iterrows():
                 track_id = int(row["track_id"])
@@ -202,7 +239,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                 if box_w > 5 and box_h > 5:
                     raw_fx1, raw_fy1, raw_fx2, raw_fy2 = None, None, None, None
 
-                    # Intento 1: Detección precisa de rostro con YuNet (cv2.FaceDetectorYN)
+                    # Intento 1: Detección exacta con YuNet en hasta 70% de la altura del cuerpo
                     if yunet_detector is not None:
                         crop_y2 = min(h, y1_c + int(box_h * 0.70))
                         crop = frame[y1_c:crop_y2, x1_c:x2_c]
@@ -222,7 +259,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                                     raw_fx2 = min(w, x1_c + int(fx + fw) + pad_w)
                                     raw_fy2 = min(h, y1_c + int(fy + fh) + pad_h)
 
-                    # Intento 2: Fallback si YuNet no detectó rostro (persona de espaldas/perfil)
+                    # Intento 2: Fallback proporcional / keypoints cuando YuNet no detecta (de espaldas/perfil)
                     if raw_fx1 is None:
                         nx, ny = row.get("nose_x", np.nan), row.get("nose_y", np.nan)
                         lex, ley = row.get("left_eye_x", np.nan), row.get("left_eye_y", np.nan)
@@ -263,7 +300,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
 
                     raw_roi = (float(raw_fx1), float(raw_fy1), float(raw_fx2), float(raw_fy2))
 
-                    # Suavizado exponencial (EMA) con el frame anterior para eliminar parpadeo
+                    # Suavizado exponencial (EMA) continuo cuadro a cuadro
                     if track_id in estado_rostros:
                         prev_roi = estado_rostros[track_id]["roi"]
                         sm_fx1 = alpha_suavizado * raw_roi[0] + (1.0 - alpha_suavizado) * prev_roi[0]
@@ -279,7 +316,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                         "last_seen": frame_idx
                     }
 
-        # 3. Aplicar Blur Continuo e Ininterrumpido en Rostros (Persistencia Temporal)
+        # 3. Aplicar Difuminado Elíptico de Rostros
         if blur_faces:
             tracks_a_eliminar = []
             for tid, info in estado_rostros.items():
@@ -295,7 +332,6 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                         roi = frame[fy1:fy2, fx1:fx2]
                         if roi.size > 0:
                             rh, rw = roi.shape[:2]
-                            # Mosaico (pixelado) + Gaussian Blur
                             small_w = max(1, rw // 10)
                             small_h = max(1, rh // 10)
                             small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
@@ -305,12 +341,11 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                             k_h = max(15, (rh // 2) * 2 + 1)
                             blurred_roi = cv2.GaussianBlur(pix, (k_w, k_h), 0)
 
-                            # Máscara elíptica ajustada a la forma natural del rostro
                             mask_ellipse = np.zeros((rh, rw), dtype=np.uint8)
                             center = (rw // 2, rh // 2)
-                            axes = (int(rw * 0.48), int(rh * 0.48))
+                            axes = (int(rw * 0.52), int(rh * 0.52))
                             cv2.ellipse(mask_ellipse, center, axes, 0, 0, 360, 255, -1)
-                            mask_ellipse = cv2.GaussianBlur(mask_ellipse, (15, 15), 0)
+                            mask_ellipse = cv2.GaussianBlur(mask_ellipse, (9, 9), 0)
                             alpha_m = (mask_ellipse.astype(np.float32) / 255.0)[:, :, None]
 
                             blended_roi = (blurred_roi.astype(np.float32) * alpha_m + roi.astype(np.float32) * (1.0 - alpha_m)).astype(np.uint8)
@@ -321,7 +356,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
             for tid in tracks_a_eliminar:
                 del estado_rostros[tid]
 
-        # 4. Dibujar Detecciones, Pose y Etiquetas Visuales
+        # 4. Dibujar Detecciones y Pose Corporal (Sin letreros de Pick/Put)
         if frame_idx in df_por_frame:
             for _, row in df_por_frame[frame_idx].iterrows():
                 x1, y1, x2, y2 = int(row["x1"]), int(row["y1"]), int(row["x2"]), int(row["y2"])
@@ -329,7 +364,7 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                 conf = float(row.get("conf", 0.0))
                 color = color_para_id(track_id)
 
-                # Bounding box del cliente
+                # Bounding box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(frame, f"ID {track_id} ({conf:.2f})", (x1, max(y1 - 8, 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -337,7 +372,6 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                 # Punto de apoyo pies
                 xf, yf = int(row["x_foot"]), int(row["y_foot"])
                 cv2.circle(frame, (xf, yf), 5, color, -1)
-                cv2.circle(frame, (xf, yf), 5, (255, 255, 255), 1)
 
                 # Esqueleto corporal
                 for idx1, idx2 in ESQUELETO_CUERPO:
@@ -351,65 +385,48 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                         if c1 > 0.3 and c2 > 0.3 and not np.isnan(x_1) and not np.isnan(x_2):
                             cv2.line(frame, (int(x_1), int(y_1)), (int(x_2), int(y_2)), color, 2)
 
-                # Dibujar muñecas
-                for mano_prefix in ["left_wrist", "right_wrist"]:
-                    mx = row.get(f"{mano_prefix}_x", np.nan)
-                    my = row.get(f"{mano_prefix}_y", np.nan)
-                    if not np.isnan(mx) and not np.isnan(my):
-                        cv2.circle(frame, (int(mx), int(my)), 4, (0, 255, 255), -1)
-
-                # Dibujar rostro y vector de mirada únicamente si NO se activó blur
-                if not blur_faces:
-                    nx, ny = row.get("nose_x", np.nan), row.get("nose_y", np.nan)
-                    lex, ley = row.get("left_eye_x", np.nan), row.get("left_eye_y", np.nan)
-                    rex, rey = row.get("right_eye_x", np.nan), row.get("right_eye_y", np.nan)
-
-                    if not np.isnan(nx) and not np.isnan(ny):
-                        cv2.circle(frame, (int(nx), int(ny)), 3, (255, 0, 255), -1)
-                        if not np.isnan(lex) and not np.isnan(rex):
-                            cv2.circle(frame, (int(lex), int(ley)), 2, (0, 255, 255), -1)
-                            cv2.circle(frame, (int(rex), int(rey)), 2, (0, 255, 255), -1)
-                            eye_cx = (lex + rex) / 2.0
-                            eye_cy = (ley + rey) / 2.0
-                            gaze_vx = (nx - eye_cx) * 2.5
-                            gaze_vy = (ny - eye_cy) * 2.5
-                            cv2.arrowedLine(frame, (int(eye_cx), int(eye_cy)),
-                                            (int(nx + gaze_vx), int(ny + gaze_vy)), (0, 230, 255), 2, tipLength=0.3)
-
-        # 5. HUD Dashboard Superior
+        # 5. Dashboard Superior HUD
         t_act_s = frame_idx / fps
-        pct = (frame_idx / max(total_frames, 1)) * 100
+        pct = (frame_idx / max(frames_a_procesar, 1)) * 100
 
         cv2.rectangle(frame, (0, 0), (w, 38), (15, 15, 15), -1)
-        hud_txt = f"ANALISIS RETAIL | Tiempo: {format_mmss(t_act_s)} / {format_mmss(duracion_total_s)}"
-        cv2.putText(frame, hud_txt, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 230, 255), 2)
+        hud_txt = f"ANALISIS RETAIL 15S (YUNET) | Tiempo: {format_mmss(t_act_s)} / {format_mmss(duracion_proc_s)} (FPS: {fps:.1f})"
+        cv2.putText(frame, hud_txt, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 230, 255), 2)
 
         out.write(frame)
         frame_idx += 1
 
-        if frame_idx % 100 == 0:
-            print(f"  Procesando video anotado: {frame_idx}/{total_frames} frames ({pct:.1f}%)...", end="\r")
+        if frame_idx % 25 == 0 or frame_idx == frames_a_procesar:
+            print(f"  Procesando cuadro {frame_idx}/{frames_a_procesar} ({pct:.1f}%)...", end="\r")
 
     cap.release()
     out.release()
 
-    print("\n" + "=" * 60)
-    print(f"✅ Video anotado con PICK-UP y PUT-BACK guardado exitosamente en:")
-    print(f"   📁 {os.path.abspath(salida_path)}")
-    print("=" * 60 + "\n")
+    print("\n" + "=" * 65)
+    print(f"[OK] Video anotado de 15 segundos guardado exitosamente:")
+    print(f"     Path: {os.path.abspath(salida_path)}")
+    print("=" * 65 + "\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generador de Video Anotado Retail con PICK-UP y PUT-BACK")
+    parser = argparse.ArgumentParser(description="Anotador de Video Retail con YuNet (Sin Frame Skip, 15s)")
     parser.add_argument("--video", required=True, help="Ruta del video original")
-    parser.add_argument("--parquet", required=True, help="Ruta del archivo .parquet de tracking")
+    parser.add_argument("--parquet", default=None, help="Ruta del archivo .parquet de tracking (opcional)")
     parser.add_argument("--zonas", default=None, help="Ruta del archivo .json de zonas")
     parser.add_argument("--carpeta", default="videos_anotados", help="Carpeta de destino para el video")
-    parser.add_argument("--salida", default=None, help="Nombre del archivo de salida")
-    parser.add_argument("--no-blur", action="store_true", help="Desactivar difuminado de rostros (por defecto activo para protección de datos biométricos)")
+    parser.add_argument("--salida", default=None, help="Nombre personalizado del archivo de salida")
+    parser.add_argument("--max-segundos", type=float, default=15.0, help="Duración máxima en segundos a procesar (default 15.0)")
+    parser.add_argument("--no-blur", action="store_true", help="Desactivar difuminado de rostros")
     parser.add_argument("--yunet-model", default="face_detection_yunet_2023mar.onnx", help="Ruta al modelo YuNet .onnx")
     args = parser.parse_args()
 
-    anotar_video(args.video, args.parquet, zonas_path=args.zonas,
-                 carpeta_salida=args.carpeta, salida_filename=args.salida,
-                 blur_faces=not args.no_blur, yunet_model_path=args.yunet_model)
+    anotar_video_yunet_15s(
+        video_path=args.video,
+        parquet_path=args.parquet,
+        zonas_path=args.zonas,
+        carpeta_salida=args.carpeta,
+        salida_filename=args.salida,
+        max_segundos=args.max_segundos,
+        blur_faces=not args.no_blur,
+        yunet_model_path=args.yunet_model
+    )

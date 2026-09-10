@@ -82,6 +82,7 @@ class RetailTrackerApp:
         self.dispositivo_opt = tk.StringVar(value="⚡ GPU (CUDA)" if torch.cuda.is_available() else "💻 Solo CPU")
         self.generar_video_anotado = tk.BooleanVar(value=False)
         self.blur_caras = tk.BooleanVar(value=True)
+        self.tracker_opt = tk.StringVar(value="⭐ Roboflow Supervision (ByteTrack Extendido)")
 
         self.frame_original = None
         self.h_orig = 0
@@ -243,9 +244,14 @@ class RetailTrackerApp:
         spn_imgsz.grid(row=0, column=5)
 
         lbl_disp = ttk.Label(frame_params, text="⚡ Motor:", background=self.colors["card"])
-        lbl_disp.grid(row=1, column=0, columnspan=2, sticky="w", padx=(0, 3), pady=(5, 0))
-        cb_disp = ttk.Combobox(frame_params, textvariable=self.dispositivo_opt, values=["⚡ GPU (CUDA)", "💻 Solo CPU"], state="readonly", width=14, font=("Segoe UI", 9))
-        cb_disp.grid(row=1, column=2, columnspan=4, sticky="w", pady=(5, 0))
+        lbl_disp.grid(row=1, column=0, sticky="w", padx=(0, 3), pady=(5, 0))
+        cb_disp = ttk.Combobox(frame_params, textvariable=self.dispositivo_opt, values=["⚡ GPU (CUDA)", "💻 Solo CPU"], state="readonly", width=12, font=("Segoe UI", 9))
+        cb_disp.grid(row=1, column=1, columnspan=2, sticky="w", pady=(5, 0))
+
+        lbl_track = ttk.Label(frame_params, text="🎯 Tracker:", background=self.colors["card"])
+        lbl_track.grid(row=1, column=3, sticky="w", padx=(5, 3), pady=(5, 0))
+        cb_track = ttk.Combobox(frame_params, textvariable=self.tracker_opt, values=["⭐ Roboflow Supervision (ByteTrack Extendido)", "ByteTrack (YAML)", "BoT-SORT (YAML)"], state="readonly", width=25, font=("Segoe UI", 9))
+        cb_track.grid(row=1, column=4, columnspan=2, sticky="w", pady=(5, 0))
 
         sec2 = ttk.Frame(left_panel, style="Card.TFrame", padding=10)
         sec2.pack(fill=tk.X, pady=(0, 8))
@@ -1118,6 +1124,7 @@ class RetailTrackerApp:
         sys.stdout = QueueLogger(self.log_queue)
         try:
             disp_val = "cuda" if "GPU" in self.dispositivo_opt.get() else "cpu"
+            sel_tracker = "supervision" if "Supervision" in self.tracker_opt.get() else ("bytetrack_largo.yaml" if "ByteTrack" in self.tracker_opt.get() else "botsort.yaml")
             extraer_mod.modo_guardar(
                 video_path=video_path,
                 camera_id=camera_id,
@@ -1127,6 +1134,7 @@ class RetailTrackerApp:
                 carpeta_salida=carpeta_salida,
                 frame_skip=self.frame_skip.get(),
                 conf=self.conf_thresh.get(),
+                tracker=sel_tracker,
                 dispositivo=disp_val
             )
             self.log_queue.put(("done", salida_parquet))

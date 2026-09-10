@@ -372,8 +372,6 @@ def generar_mapa_gondolas_exclusivo(df_val, fondo, zonas_validas, zonas_exclusio
     for zg in zonas_gondola:
         pts = zg["polygon"]
         cv2.polylines(resultado, [pts], isClosed=True, color=(0, 165, 255), thickness=2)
-        cv2.putText(resultado, f"Gondola: {zg['id']}", tuple(pts[0]),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 230, 255), 2)
 
     if suavizado.max() > 0:
         pct_high = np.percentile(suavizado[suavizado > 0], 97) if np.any(suavizado > 0) else 1.0
@@ -599,31 +597,7 @@ def generar_mapa_zonas(df_val, fondo, zonas_validas, zonas_exclusion, salida_png
 
     for idx_z, s in enumerate(stats_zonas):
         pts = s["polygon"]
-        intensidad = s["t_total"] / max_t
-        color_bgr = obtener_color_permanencia(intensidad)
-
         cv2.polylines(resultado, [pts], True, (255, 255, 255), 2)
-
-        x_min = int(np.min(pts[:, 0]))
-        y_min = int(np.min(pts[:, 1]))
-
-        txt1 = f"Zona: {s['nombre']}"
-        txt2 = f"Perm: {s['t_total']:.1f}s | {s['vis_unicos']} pers"
-        txt3 = f"Manos en Gondola: {s['alcances_mano']} alcances" if s["alcances_mano"] > 0 else "Manos: 0 alcances"
-
-        box_w, box_h = 230, 56
-        box_x = max(min(x_min, w - box_w - 10), 10)
-        box_y = max(y_min - box_h - (idx_z % 2) * 60 - 5, 10)
-
-        sub_img = resultado[box_y:box_y+box_h, box_x:box_x+box_w]
-        black_rect = np.zeros(sub_img.shape, dtype=np.uint8)
-        res_box = cv2.addWeighted(sub_img, 0.25, black_rect, 0.75, 0)
-        resultado[box_y:box_y+box_h, box_x:box_x+box_w] = res_box
-        cv2.rectangle(resultado, (box_x, box_y), (box_x + box_w, box_y + box_h), color_bgr, 2)
-
-        cv2.putText(resultado, txt1, (box_x + 6, box_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-        cv2.putText(resultado, txt2, (box_x + 6, box_y + 33), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 230, 255), 1)
-        cv2.putText(resultado, txt3, (box_x + 6, box_y + 49), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 120, 255), 1)
 
     if zonas_exclusion:
         resultado = dibujar_zonas_exclusion_sobre_imagen(resultado, zonas_exclusion)

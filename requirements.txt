@@ -4,6 +4,7 @@
 # Visión por Computador y Tracking
 ultralytics
 opencv-python
+supervision
 
 # Deep Learning (PyTorch con GPU)
 torch

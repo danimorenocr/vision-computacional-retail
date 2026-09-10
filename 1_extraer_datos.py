@@ -44,6 +44,12 @@ import torch
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
 
+try:
+    import supervision as sv
+    HAS_SUPERVISION = True
+except ImportError:
+    HAS_SUPERVISION = False
+
 # Silence noisy third-party warnings and Ultralytics' internal logger so that
 # our own progress prints (below) stay readable in the console.
 warnings.filterwarnings("ignore")
@@ -294,7 +300,7 @@ def dibujar_pose_y_caja(frame, box, track_id, conf, keypoints_frame, kp_confs_fr
 
 
 def modo_live(video_path, modelo_path="yolo26n-pose.pt", conf=0.20, imgsz=640,
-              tracker="botsort.yaml"):
+              tracker="supervision"):
     """
     Run the tracker interactively in a live OpenCV window, for debugging and
     demoing. Nothing is written to disk in this mode — it exists purely to
@@ -521,7 +527,7 @@ def limpiar_y_renumerar_ids(df, min_duracion_s=1, max_gap_s=2, max_dist_px=80.0,
 
 def modo_guardar(video_path, camera_id, modelo_path="yolo26n-pose.pt",
                  imgsz=640, conf=0.35, salida_parquet=None, carpeta_salida="datos_parquet",
-                 frame_skip=2, tracker="botsort.yaml",
+                 frame_skip=2, tracker="supervision",
                  dispositivo="auto", min_duracion_s=1.0, max_gap_s=4.0, max_dist_px=120.0):
     """
     Run the production pose-tracking pipeline over a video and persist the
@@ -631,6 +637,17 @@ def modo_guardar(video_path, camera_id, modelo_path="yolo26n-pose.pt",
         except Exception as e:
             logger.warning(f"Advertencia en etapa de calentamiento (warmup): {e}", exc_info=True)
 
+        usar_supervision = ("supervision" in str(tracker).lower() or tracker == "sv") and HAS_SUPERVISION
+        sv_tracker = None
+        if usar_supervision:
+            logger.info("Activando Roboflow Supervision ByteTrack con memoria ampliada para retail (lost_track_buffer=90)...")
+            print("🚀 Tracker Activo: Roboflow Supervision ByteTrack (Memoria de oclusión extendida)", flush=True)
+            sv_tracker = sv.ByteTrack(
+                track_activation_threshold=conf,
+                lost_track_buffer=int(fps * 3.5),
+                minimum_matching_threshold=0.8
+            )
+
         filas = []
         frames_procesados = 0
 
@@ -659,54 +676,110 @@ def modo_guardar(video_path, camera_id, modelo_path="yolo26n-pose.pt",
                     r = None
 
                     try:
-                        resultados = model.track(
-                            frame,
-                            tracker=tracker_path,
-                            persist=True,
-                            classes=[0],
-                            conf=conf,
-                            imgsz=imgsz,
-                            verbose=False,
-                            device=dispositivo_real
-                        )
-                        if resultados and len(resultados) > 0:
-                            r = resultados[0]
+                        if usar_supervision and sv_tracker is not None:
+                            resultados = model(
+                                frame,
+                                classes=[0],
+                                conf=conf,
+                                imgsz=imgsz,
+                                verbose=False,
+                                device=dispositivo_real
+                            )
+                            if resultados and len(resultados) > 0:
+                                r = resultados[0]
+                                if r.boxes is not None and len(r.boxes) > 0:
+                                    det = sv.Detections.from_ultralytics(r)
+                                    if r.keypoints is not None:
+                                        det.data["keypoints"] = r.keypoints.xy.cpu().numpy()
+                                        if r.keypoints.conf is not None:
+                                            det.data["kp_confs"] = r.keypoints.conf.cpu().numpy()
 
-                        if r.boxes.id is not None and r.keypoints is not None:
-                            boxes = r.boxes.xyxy.cpu().numpy()
-                            ids = r.boxes.id.int().cpu().numpy()
-                            confs = r.boxes.conf.cpu().numpy()
-                            keypoints = r.keypoints.xy.cpu().numpy()
-                            kp_confs = (r.keypoints.conf.cpu().numpy()
-                                        if r.keypoints.conf is not None else None)
+                                    tracked_det = sv_tracker.update_with_detections(det)
 
-                            for j, (box, track_id, confidence) in enumerate(zip(boxes, ids, confs)):
-                                x1, y1, x2, y2 = box
-                                x_center = (x1 + x2) / 2.0
-                                y_center = (y1 + y2) / 2.0
-                                x_foot = (x1 + x2) / 2.0
-                                y_foot = y2
+                                    if tracked_det.tracker_id is not None and len(tracked_det.tracker_id) > 0:
+                                        boxes = tracked_det.xyxy
+                                        ids = tracked_det.tracker_id.astype(int)
+                                        confs = tracked_det.confidence
+                                        keypoints = tracked_det.data.get("keypoints", None)
+                                        kp_confs = tracked_det.data.get("kp_confs", None)
 
-                                fila = {
-                                    "camera_id": camera_id,
-                                    "frame_idx": frame_idx,
-                                    "timestamp_s": frame_idx / fps,
-                                    "track_id": int(track_id),
-                                    "x_foot": float(x_foot), "y_foot": float(y_foot),
-                                    "x_center": float(x_center), "y_center": float(y_center),
-                                    "x1": float(x1), "y1": float(y1),
-                                    "x2": float(x2), "y2": float(y2),
-                                    "conf": float(confidence),
-                                }
+                                        for j, (box, track_id, confidence) in enumerate(zip(boxes, ids, confs)):
+                                            x1, y1, x2, y2 = box
+                                            x_center = (x1 + x2) / 2.0
+                                            y_center = (y1 + y2) / 2.0
+                                            x_foot = (x1 + x2) / 2.0
+                                            y_foot = y2
 
-                                for idx_kp, nombre in KEYPOINTS_CUERPO.items():
-                                    kx, ky = keypoints[j][idx_kp]
-                                    fila[f"{nombre}_x"] = float(kx)
-                                    fila[f"{nombre}_y"] = float(ky)
-                                    if kp_confs is not None:
-                                        fila[f"{nombre}_conf"] = float(kp_confs[j][idx_kp])
+                                            fila = {
+                                                "camera_id": camera_id,
+                                                "frame_idx": frame_idx,
+                                                "timestamp_s": frame_idx / fps,
+                                                "track_id": int(track_id),
+                                                "x_foot": float(x_foot), "y_foot": float(y_foot),
+                                                "x_center": float(x_center), "y_center": float(y_center),
+                                                "x1": float(x1), "y1": float(y1),
+                                                "x2": float(x2), "y2": float(y2),
+                                                "conf": float(confidence),
+                                            }
 
-                                filas.append(fila)
+                                            if keypoints is not None and j < len(keypoints):
+                                                for idx_kp, nombre in KEYPOINTS_CUERPO.items():
+                                                    kx, ky = keypoints[j][idx_kp]
+                                                    fila[f"{nombre}_x"] = float(kx)
+                                                    fila[f"{nombre}_y"] = float(ky)
+                                                    if kp_confs is not None and j < len(kp_confs):
+                                                        fila[f"{nombre}_conf"] = float(kp_confs[j][idx_kp])
+
+                                            filas.append(fila)
+                        else:
+                            resultados = model.track(
+                                frame,
+                                tracker=tracker_path,
+                                persist=True,
+                                classes=[0],
+                                conf=conf,
+                                imgsz=imgsz,
+                                verbose=False,
+                                device=dispositivo_real
+                            )
+                            if resultados and len(resultados) > 0:
+                                r = resultados[0]
+
+                            if r is not None and r.boxes is not None and r.boxes.id is not None and r.keypoints is not None:
+                                boxes = r.boxes.xyxy.cpu().numpy()
+                                ids = r.boxes.id.int().cpu().numpy()
+                                confs = r.boxes.conf.cpu().numpy()
+                                keypoints = r.keypoints.xy.cpu().numpy()
+                                kp_confs = (r.keypoints.conf.cpu().numpy()
+                                            if r.keypoints.conf is not None else None)
+
+                                for j, (box, track_id, confidence) in enumerate(zip(boxes, ids, confs)):
+                                    x1, y1, x2, y2 = box
+                                    x_center = (x1 + x2) / 2.0
+                                    y_center = (y1 + y2) / 2.0
+                                    x_foot = (x1 + x2) / 2.0
+                                    y_foot = y2
+
+                                    fila = {
+                                        "camera_id": camera_id,
+                                        "frame_idx": frame_idx,
+                                        "timestamp_s": frame_idx / fps,
+                                        "track_id": int(track_id),
+                                        "x_foot": float(x_foot), "y_foot": float(y_foot),
+                                        "x_center": float(x_center), "y_center": float(y_center),
+                                        "x1": float(x1), "y1": float(y1),
+                                        "x2": float(x2), "y2": float(y2),
+                                        "conf": float(confidence),
+                                    }
+
+                                    for idx_kp, nombre in KEYPOINTS_CUERPO.items():
+                                        kx, ky = keypoints[j][idx_kp]
+                                        fila[f"{nombre}_x"] = float(kx)
+                                        fila[f"{nombre}_y"] = float(ky)
+                                        if kp_confs is not None:
+                                            fila[f"{nombre}_conf"] = float(kp_confs[j][idx_kp])
+
+                                    filas.append(fila)
 
                     except Exception as e:
                         logger.error(f"Error procesando frame {frame_idx} (timestamp {frame_idx/fps:.2f}s): {e}", exc_info=True)
@@ -810,8 +883,8 @@ if __name__ == "__main__":
                         help="Output directory used to build the default output filename.")
     parser.add_argument("--frame_skip", type=int, default=2,
                         help="Process 1 out of every N raw video frames (default: 2).")
-    parser.add_argument("--tracker", default="botsort.yaml",
-                        help="Filename of the tracker YAML configuration to use.")
+    parser.add_argument("--tracker", default="supervision",
+                        help="Tracker a utilizar ('supervision', 'botsort.yaml', 'bytetrack_largo.yaml').")
     parser.add_argument("--dispositivo", default="auto", choices=["auto", "cuda", "cpu"],
                         help="Inference device: 'auto', 'cuda' (GPU), or 'cpu'.")
     parser.add_argument("--log_file", default="pipeline_extraer_datos.log",
