@@ -81,6 +81,7 @@ class RetailTrackerApp:
         self.conf_thresh = tk.DoubleVar(value=0.25)
         self.dispositivo_opt = tk.StringVar(value="⚡ GPU (CUDA)" if torch.cuda.is_available() else "💻 Solo CPU")
         self.generar_video_anotado = tk.BooleanVar(value=False)
+        self.blur_caras = tk.BooleanVar(value=True)
 
         self.frame_original = None
         self.h_orig = 0
@@ -273,7 +274,17 @@ class RetailTrackerApp:
             activebackground=self.colors["card"], activeforeground=self.colors["fg"],
             font=("Segoe UI", 9, "bold")
         )
-        self.chk_anotado.pack(anchor="w", pady=(0, 6))
+        self.chk_anotado.pack(anchor="w", pady=(0, 2))
+
+        self.chk_blur = tk.Checkbutton(
+            sec3, text="🔒 Blur en Rostros (Protección Ley 1581 / Biométricos)",
+            variable=self.blur_caras,
+            bg=self.colors["card"], fg=self.colors["fg"],
+            selectcolor=self.colors["panel"],
+            activebackground=self.colors["card"], activeforeground=self.colors["fg"],
+            font=("Segoe UI", 9)
+        )
+        self.chk_blur.pack(anchor="w", pady=(0, 6))
 
         self.btn_generar_mapas = ttk.Button(sec3, text="📊 GENERAR MAPAS Y MÉTRICAS", command=self.generar_mapas_y_metricas)
         self.btn_generar_mapas.pack(fill=tk.X, ipady=4)
@@ -1217,7 +1228,8 @@ class RetailTrackerApp:
                         parquet_path=salida_parquet,
                         zonas_path=ruta_json if os.path.exists(ruta_json) else None,
                         carpeta_salida=out_dir,
-                        salida_filename=nombre_video_salida
+                        salida_filename=nombre_video_salida,
+                        blur_faces=self.blur_caras.get()
                     )
                 else:
                     self.log("  [3/3] ⏩ Omisión de video anotado por configuración del Checkbox.")

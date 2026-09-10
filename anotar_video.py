@@ -60,7 +60,7 @@ def color_para_id(track_id):
     return int(b * 255), int(g * 255), int(r * 255)
 
 
-def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="videos_anotados", salida_filename=None):
+def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="videos_anotados", salida_filename=None, blur_faces=True):
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"No se encontró el video: {video_path}")
     if not os.path.exists(parquet_path):
@@ -122,6 +122,12 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
     print(f"Eventos clasificados: {len(df_eventos)} (Pick-Ups / Put-Backs)")
     print(f"Guardando video anotado en carpeta: {os.path.abspath(salida_path)}")
 
+    # Memoria temporal para suavizado y persistencia continua de rostros
+    # Dict: track_id -> {"roi": (fx1, fy1, fx2, fy2), "last_seen": frame_idx}
+    estado_rostros = {}
+    alpha_suavizado = 0.40  # Factor EMA de suavizado espacial
+    max_persistencia_frames = int(fps * 0.75)  # Retener blur durante 0.75s si hay saltos de frames
+
     frame_idx = 0
 
     while True:
@@ -147,14 +153,113 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
 
         frame = cv2.addWeighted(overlay, 0.25, frame, 0.75, 0)
 
-        # 2. Verificar Eventos Activos de PICK-UP vs PUT-BACK para el frame actual
+        # 2. Actualizar Coordenadas de Rostros para las Detecciones del Frame Actual
+        if frame_idx in df_por_frame:
+            for _, row in df_por_frame[frame_idx].iterrows():
+                track_id = int(row["track_id"])
+                x1, y1, x2, y2 = int(row["x1"]), int(row["y1"]), int(row["x2"]), int(row["y2"])
+                x1_c, y1_c = max(0, x1), max(0, y1)
+                x2_c, y2_c = min(w, x2), min(h, y2)
+                box_w = x2_c - x1_c
+                box_h = y2_c - y1_c
+
+                if box_w > 5 and box_h > 5:
+                    # Keypoints faciales
+                    nx, ny = row.get("nose_x", np.nan), row.get("nose_y", np.nan)
+                    lex, ley = row.get("left_eye_x", np.nan), row.get("left_eye_y", np.nan)
+                    rex, rey = row.get("right_eye_x", np.nan), row.get("right_eye_y", np.nan)
+                    ear_lx, ear_ly = row.get("left_ear_x", np.nan), row.get("left_ear_y", np.nan)
+                    ear_rx, ear_ry = row.get("right_ear_x", np.nan), row.get("right_ear_y", np.nan)
+
+                    pts_face_x = [pt for pt in [nx, lex, rex, ear_lx, ear_rx] if not np.isnan(pt)]
+                    pts_face_y = [pt for pt in [ny, ley, rey, ear_ly, ear_ry] if not np.isnan(pt)]
+
+                    # Estimación robusta base (porción superior del cuerpo / hombros)
+                    ls_y = row.get("left_shoulder_y", np.nan)
+                    rs_y = row.get("right_shoulder_y", np.nan)
+                    shoulders_y = [sy for sy in [ls_y, rs_y] if not np.isnan(sy)]
+
+                    raw_fy1 = max(0, int(y1_c - box_h * 0.05))
+                    if shoulders_y:
+                        raw_fy2 = min(h, int(min(shoulders_y)))
+                    else:
+                        raw_fy2 = min(h, int(y1_c + box_h * 0.28))
+
+                    cx = (x1_c + x2_c) // 2
+                    half_w = int(box_w * 0.38)
+                    raw_fx1 = max(0, cx - half_w)
+                    raw_fx2 = min(w, cx + half_w)
+
+                    # Si hay keypoints de rostro, expandir la caja para contenerlos completamente con margen
+                    if len(pts_face_x) >= 2 and len(pts_face_y) >= 2:
+                        min_kp_x, max_kp_x = min(pts_face_x), max(pts_face_x)
+                        min_kp_y, max_kp_y = min(pts_face_y), max(pts_face_y)
+                        kp_w = max_kp_x - min_kp_x
+                        kp_h = max_kp_y - min_kp_y
+                        pad_x = max(int(kp_w * 0.8), 25)
+                        pad_y = max(int(kp_h * 0.8), 25)
+
+                        raw_fx1 = min(raw_fx1, max(0, int(min_kp_x - pad_x)))
+                        raw_fy1 = min(raw_fy1, max(0, int(min_kp_y - pad_y)))
+                        raw_fx2 = max(raw_fx2, min(w, int(max_kp_x + pad_x)))
+                        raw_fy2 = max(raw_fy2, min(h, int(max_kp_y + pad_y)))
+
+                    raw_roi = (float(raw_fx1), float(raw_fy1), float(raw_fx2), float(raw_fy2))
+
+                    # Suavizado exponencial (EMA) con el frame anterior para eliminar parpadeo
+                    if track_id in estado_rostros:
+                        prev_roi = estado_rostros[track_id]["roi"]
+                        sm_fx1 = alpha_suavizado * raw_roi[0] + (1.0 - alpha_suavizado) * prev_roi[0]
+                        sm_fy1 = alpha_suavizado * raw_roi[1] + (1.0 - alpha_suavizado) * prev_roi[1]
+                        sm_fx2 = alpha_suavizado * raw_roi[2] + (1.0 - alpha_suavizado) * prev_roi[2]
+                        sm_fy2 = alpha_suavizado * raw_roi[3] + (1.0 - alpha_suavizado) * prev_roi[3]
+                        smoothed_roi = (sm_fx1, sm_fy1, sm_fx2, sm_fy2)
+                    else:
+                        smoothed_roi = raw_roi
+
+                    estado_rostros[track_id] = {
+                        "roi": smoothed_roi,
+                        "last_seen": frame_idx
+                    }
+
+        # 3. Aplicar Blur Continuo e Ininterrumpido en Rostros (Persistencia Temporal)
+        if blur_faces:
+            tracks_a_eliminar = []
+            for tid, info in estado_rostros.items():
+                frames_desde_ultimo = frame_idx - info["last_seen"]
+                if frames_desde_ultimo <= max_persistencia_frames:
+                    fx1_f, fy1_f, fx2_f, fy2_f = info["roi"]
+                    fx1 = max(0, int(round(fx1_f)))
+                    fy1 = max(0, int(round(fy1_f)))
+                    fx2 = min(w, int(round(fx2_f)))
+                    fy2 = min(h, int(round(fy2_f)))
+
+                    if (fx2 > fx1) and (fy2 > fy1):
+                        roi = frame[fy1:fy2, fx1:fx2]
+                        if roi.size > 0:
+                            rh, rw = roi.shape[:2]
+                            # Mosaico (pixelado) + Gaussian Blur
+                            small_w = max(1, rw // 10)
+                            small_h = max(1, rh // 10)
+                            small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+                            pix = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+
+                            k_w = max(15, (rw // 2) * 2 + 1)
+                            k_h = max(15, (rh // 2) * 2 + 1)
+                            frame[fy1:fy2, fx1:fx2] = cv2.GaussianBlur(pix, (k_w, k_h), 0)
+                else:
+                    tracks_a_eliminar.append(tid)
+
+            for tid in tracks_a_eliminar:
+                del estado_rostros[tid]
+
+        # 4. Verificar Eventos Activos de PICK-UP vs PUT-BACK para el frame actual
         eventos_activos_frame = []
         if len(df_eventos) > 0 and "frame_inicio" in df_eventos.columns:
-            # Mantener visible la etiqueta durante el alcance y hasta 2 segundos (50 frames) después
             mask_act = (df_eventos["frame_inicio"] <= frame_idx) & (frame_idx <= df_eventos["frame_fin"] + 45)
             eventos_activos_frame = df_eventos[mask_act]
 
-        # 3. Dibujar Detecciones, Pose y Etiquetas Visuales
+        # 5. Dibujar Detecciones, Pose y Etiquetas Visuales
         if frame_idx in df_por_frame:
             for _, row in df_por_frame[frame_idx].iterrows():
                 x1, y1, x2, y2 = int(row["x1"]), int(row["y1"]), int(row["x2"]), int(row["y2"])
@@ -191,25 +296,23 @@ def anotar_video(video_path, parquet_path, zonas_path=None, carpeta_salida="vide
                     if not np.isnan(mx) and not np.isnan(my):
                         cv2.circle(frame, (int(mx), int(my)), 4, (0, 255, 255), -1)
 
-                # Dibujar rostro y vector de mirada (nariz + ojos)
-                nx, ny = row.get("nose_x", np.nan), row.get("nose_y", np.nan)
-                lex, ley = row.get("left_eye_x", np.nan), row.get("left_eye_y", np.nan)
-                rex, rey = row.get("right_eye_x", np.nan), row.get("right_eye_y", np.nan)
+                # Dibujar rostro y vector de mirada únicamente si NO se activó blur
+                if not blur_faces:
+                    nx, ny = row.get("nose_x", np.nan), row.get("nose_y", np.nan)
+                    lex, ley = row.get("left_eye_x", np.nan), row.get("left_eye_y", np.nan)
+                    rex, rey = row.get("right_eye_x", np.nan), row.get("right_eye_y", np.nan)
 
-                if not np.isnan(nx) and not np.isnan(ny):
-                    # Círculo de la nariz (Rosa/Magenta)
-                    cv2.circle(frame, (int(nx), int(ny)), 3, (255, 0, 255), -1)
-                    if not np.isnan(lex) and not np.isnan(rex):
-                        # Círculos de los ojos (Amarillo)
-                        cv2.circle(frame, (int(lex), int(ley)), 2, (0, 255, 255), -1)
-                        cv2.circle(frame, (int(rex), int(rey)), 2, (0, 255, 255), -1)
-                        # Vector de dirección de mirada (línea del centro de ojos hacia la nariz)
-                        eye_cx = (lex + rex) / 2.0
-                        eye_cy = (ley + rey) / 2.0
-                        gaze_vx = (nx - eye_cx) * 2.5
-                        gaze_vy = (ny - eye_cy) * 2.5
-                        cv2.arrowedLine(frame, (int(eye_cx), int(eye_cy)),
-                                        (int(nx + gaze_vx), int(ny + gaze_vy)), (0, 230, 255), 2, tipLength=0.3)
+                    if not np.isnan(nx) and not np.isnan(ny):
+                        cv2.circle(frame, (int(nx), int(ny)), 3, (255, 0, 255), -1)
+                        if not np.isnan(lex) and not np.isnan(rex):
+                            cv2.circle(frame, (int(lex), int(ley)), 2, (0, 255, 255), -1)
+                            cv2.circle(frame, (int(rex), int(rey)), 2, (0, 255, 255), -1)
+                            eye_cx = (lex + rex) / 2.0
+                            eye_cy = (ley + rey) / 2.0
+                            gaze_vx = (nx - eye_cx) * 2.5
+                            gaze_vy = (ny - eye_cy) * 2.5
+                            cv2.arrowedLine(frame, (int(eye_cx), int(eye_cy)),
+                                            (int(nx + gaze_vx), int(ny + gaze_vy)), (0, 230, 255), 2, tipLength=0.3)
 
                 # Renderizar Banner de Acción (PICK-UP vs PUT-BACK) si hay evento para esta persona
                 if len(eventos_activos_frame) > 0:
@@ -276,8 +379,9 @@ if __name__ == "__main__":
     parser.add_argument("--parquet", required=True, help="Ruta del archivo .parquet de tracking")
     parser.add_argument("--zonas", default=None, help="Ruta del archivo .json de zonas")
     parser.add_argument("--carpeta", default="videos_anotados", help="Carpeta de destino para el video")
-    parser.add_argument("--salida", default=None, help="Nombre del archivo de video resultante")
+    parser.add_argument("--no-blur", action="store_true", help="Desactivar difuminado de rostros (por defecto activo para protección de datos biométricos)")
     args = parser.parse_args()
 
     anotar_video(args.video, args.parquet, zonas_path=args.zonas,
-                 carpeta_salida=args.carpeta, salida_filename=args.salida)
+                 carpeta_salida=args.carpeta, salida_filename=args.salida,
+                 blur_faces=not args.no_blur)
